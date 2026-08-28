@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Never the real config: it carries the bearer token.
+sms-bridge.json

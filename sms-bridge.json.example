@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "endpoint": "http://100.99.132.67:8090/sms",
+  "token": "PASTE_FROM_~/.sms2fa/token"
+}
