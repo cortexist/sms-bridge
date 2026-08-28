@@ -97,6 +97,14 @@ def current_code():
 class H(http.server.BaseHTTPRequestHandler):
     server_version = "sms-bridge"
 
+    def handle_one_request(self):
+        """A phone that times out mid-upload resets the connection; that is routine
+        on a mobile link and should not print a traceback per occurrence."""
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
+
     def _auth(self) -> bool:
         # Constant-time: the only thing between the tailnet and an endpoint that
         # hands out login codes.

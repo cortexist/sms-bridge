@@ -195,7 +195,12 @@ def add_messages(recs: list) -> dict:
             # then dropped the reference to them, so the images existed and nothing
             # pointed at them.
             old = stored.get(mid)
-            if r.get("parts") and old is not None and not old.get("parts"):
+            # Enrich whenever the incoming parts carry MORE than the stored ones.
+            # The first version only fired when the record had no parts at all, so a
+            # record that already had digests could never gain thumbnails -- the
+            # thumbnails uploaded and nothing referenced them, exactly the failure
+            # this check was added to fix one level up.
+            if r.get("parts") and old is not None and r["parts"] != old.get("parts"):
                 merged = dict(old)
                 merged["parts"] = r["parts"]
                 enriched[mid] = merged

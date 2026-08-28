@@ -63,7 +63,9 @@ _MEASURE = Console(width=400, file=io.StringIO(), force_terminal=False)
 
 REFRESH_S = 3.0
 SHOW_LAST = 300          # newest messages rendered per conversation
-FETCH_LIMIT = 25         # images requested per keypress
+# Small on purpose: each fetch is a megabyte or two off the phone, and a run that
+# tries to do dozens at once outlives its worker and loses the lot.
+FETCH_LIMIT = 8          # images requested per keypress
 BUBBLE_FRAC = 0.82       # widest a bubble may get, as a fraction of the reading pane
 BUBBLE_MIN = 20          # narrow enough that a ~65 column pane still works
 PREVIEW_LINES = 2
@@ -488,14 +490,20 @@ class BridgeTUI(App):
             # Attachments under the bubble: drawn if we hold the bytes, described if
             # not, so a skipped 30 MB video still shows that something was sent.
             for part in (m.get("parts") or []):
-                sha = part.get("sha")
-                if (sha and str(part.get("mime", "")).startswith("image/")
-                        and store.has_attachment(sha)):
-                    art = images.render(store.attachment_path(sha),
+                # Thumbnail first: it is what a half-block render can actually show,
+                # and the desktop holds every one of them. The original is fetched
+                # only when something wants it at full size.
+                shown = None
+                for key in ("thumb", "sha"):
+                    d = part.get(key)
+                    if d and store.has_attachment(d):
+                        shown = d
+                        break
+                if shown and str(part.get("mime", "")).startswith("image/"):
+                    art = images.render(store.attachment_path(shown),
                                         max_w=min(bubble_w, 48), max_h=14)
                     log.write(Padding(art, (0, 0, 0, 0 if outgoing else 2)))
-                elif sha and str(part.get("mime", "")).startswith("image/"):
-                    # Held on the phone, not here. `f` asks for it.
+                elif part.get("sha") and str(part.get("mime", "")).startswith("image/"):
                     log.write(Text("  " + images.describe(part) + "  — f to fetch",
                                    style="dim"))
                 else:
@@ -578,7 +586,12 @@ class BridgeTUI(App):
                 sha = p.get("sha")
                 if (sha and str(p.get("mime", "")).startswith("image/")
                         and not store.has_attachment(sha)):
-                    want.append((sha, m["id"]))
+                    want.append((m.get("rx", 0), sha, m["id"]))
+        # NEWEST FIRST. Taking them in archive order fetched the oldest images in the
+        # conversation -- 2019 in a thread whose visible messages were 2020 -- so the
+        # pictures being downloaded were never the ones on screen.
+        want.sort(reverse=True)
+        want = [(sha, mid) for _, sha, mid in want]
         if not want:
             self.notify("Nothing to fetch in this conversation", timeout=4)
             return
