@@ -32,6 +32,7 @@ Run:  sms-tui        (or: python -m bridge.tui from ~/Workspaces/sms-bridge)
 import io
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -48,12 +49,22 @@ from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal
+from textual.containers import Grid, Horizontal, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, OptionList, RichLog, Static
+from textual.widgets import Button, Footer, Header, OptionList, Static
 from textual.widgets.option_list import Option
 
 from bridge import images, junk, store
+
+# The chain pane is built from WIDGETS, not RichLog renderables, so that images can
+# be real image widgets. textual-image's widget cooperates with Textual's compositor
+# the way ratatui-image cooperates with ratatui's render loop; its *renderable*, used
+# inside RichLog, had its escape sequence eaten by the compositor and drew an empty
+# box in foot and nothing in ghostty.
+try:
+    from textual_image.widget import Image as ImageWidget
+except Exception:
+    ImageWidget = None
 
 # Off-screen console purely for measuring how wide a bubble will actually render.
 # RichLog sizes a write to the renderable's OWN measured width, so Align.right never
@@ -62,10 +73,20 @@ from bridge import images, junk, store
 _MEASURE = Console(width=400, file=io.StringIO(), force_terminal=False)
 
 REFRESH_S = 3.0
-SHOW_LAST = 300          # newest messages rendered per conversation
+SHOW_LAST = 80           # newest messages rendered; widgets cost more than text
 # Small on purpose: each fetch is a megabyte or two off the phone, and a run that
 # tries to do dozens at once outlives its worker and loses the lot.
 FETCH_LIMIT = 8          # images requested per keypress
+# Paired with THUMB_PX=320 on the phone, which fills 32-40 cells at foot's cell
+# width. Shrinking this box was the other way to fix the blur; raising the source
+# resolution costs 27 MB across the archive and keeps the picture large.
+# 32, not 40: a 320px thumbnail fills roughly 32-40 cells depending on the font, so
+# the lower end is the safe match -- sharper, and a smaller sixel leaves less residue
+# behind when the pane scrolls.
+IMG_W = 32               # cells wide; height follows the image's aspect ratio
+IMG_H = 16               # fallback block renderer only
+IMG_MAX_H = 16           # tallest an image may get before its width is reduced
+OPEN_LIMIT = 20          # images considered when opening externally
 BUBBLE_FRAC = 0.82       # widest a bubble may get, as a fraction of the reading pane
 BUBBLE_MIN = 20          # narrow enough that a ~65 column pane still works
 PREVIEW_LINES = 2
@@ -224,6 +245,23 @@ def thread_row(t: dict, width: int, index: int = 0) -> Group:
     return Group(*lines)
 
 
+class ChainPane(VerticalScroll):
+    """The message chain, with a full repaint on scroll.
+
+    Graphics protocols paint outside the widget tree: Textual repaints its own cells
+    when the pane scrolls, but the terminal's sixel data stays where it was until
+    something overwrites it, leaving residue -- most visibly on thin dim rules, which
+    nothing else repaints over. Forcing a repaint of the whole screen after a scroll
+    is the blunt fix available from this side; the protocol-level answer is Kitty's
+    placement/delete semantics, which foot does not implement.
+    """
+
+    def watch_scroll_y(self, old: float, new: float) -> None:
+        super().watch_scroll_y(old, new)
+        if int(old) != int(new):
+            self.screen.refresh(repaint=True)
+
+
 class ConfirmDelete(ModalScreen[bool]):
     """QUIK asks before deleting; so does this. Same action, same friction.
 
@@ -274,6 +312,10 @@ class BridgeTUI(App):
     }
     #threads > .option-list--option { padding: 0; }
     #convo { width: 1fr; height: 1fr; padding: 0 1; }
+    #convo > Static { height: auto; }
+    /* height:auto lets the widget keep the image's aspect ratio; max-height stops a
+       tall photo from taking the whole pane. */
+    #convo > .bridge-img { height: auto; max-height: 20; margin: 0 0 1 0; }
     #status { height: auto; padding: 0 1; color: $text-muted; background: $panel; }
     """
 
@@ -287,6 +329,7 @@ class BridgeTUI(App):
         Binding("u", "not_junk", "Not junk"),
         Binding("Q", "show_junk", "Quarantine"),
         Binding("f", "fetch", "Fetch images"),
+        Binding("o", "open_images", "Open"),
     ]
 
     def __init__(self) -> None:
@@ -301,12 +344,7 @@ class BridgeTUI(App):
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             yield OptionList(id="threads")
-            # min_width defaults to 78: RichLog pads every rendered line out to at
-            # least that, so in a narrower pane the right side was simply cut off.
-            # That -- not the bubble geometry -- is why the reading pane appeared to
-            # need ~82 columns.
-            yield RichLog(id="convo", wrap=True, markup=False, highlight=False,
-                          min_width=10)
+            yield ChainPane(id="convo")
         # Outside #body so it spans the window rather than being clipped to the
         # reading pane's width.
         yield Static("", id="status")
@@ -354,7 +392,7 @@ class BridgeTUI(App):
             lv.highlighted = idx
             self.show_thread(rows[idx])
         else:
-            self.query_one("#convo", RichLog).clear()
+            self.query_one("#convo", ChainPane).remove_children()
             self.selected = None
         self.refresh_status()
 
@@ -410,13 +448,9 @@ class BridgeTUI(App):
     def show_thread(self, t: dict) -> None:
         self.selected = self._key(t)
         self.selected_thread = t
-        log = self.query_one("#convo", RichLog)
-        log.clear()
+        pane = self.query_one("#convo", ChainPane)
+        pane.remove_children()
 
-        # Thread id is authoritative when we have one. Matching on aliases AS WELL was
-        # the bug: an alias like "unknown" belongs to many unrelated conversations, so
-        # opening a blocked junk thread pulled in every address-less message in the
-        # archive. Aliases are only a fallback for records that predate the thread id.
         tid = t.get("thread")
         if tid is not None:
             msgs = [m for m in store.messages() if m.get("thread") == tid]
@@ -425,52 +459,42 @@ class BridgeTUI(App):
             msgs = [m for m in store.messages()
                     if m.get("thread") is None and m.get("addr") in aliases]
         msgs = sorted(msgs, key=lambda m: m.get("rx", 0))
-        # Only the tail: a 6,891-message conversation must not be rendered in full.
+
+        widgets = []
+        # Fewer than the RichLog version carried: every message is now one or more
+        # widgets, and several hundred of those cost about a second to mount.
         if len(msgs) > SHOW_LAST:
-            log.write(Text(f"... {len(msgs) - SHOW_LAST} earlier message(s) not shown",
-                           style="dim"))
+            widgets.append(Static(Text(
+                f"... {len(msgs) - SHOW_LAST} earlier message(s) not shown",
+                style="dim")))
             msgs = msgs[-SHOW_LAST:]
-        if not msgs:
-            log.write(Text("no messages", style="dim"))
-            return
 
-        # content_size, not size: the latter includes padding, and reading it before
-        # layout has run is what froze every bubble at a fixed 78 columns regardless
-        # of the window. RichLog keeps rendered strips, so a width captured too early
-        # is permanent -- hence the re-render after refresh in on_mount.
-        pane_w = max(BUBBLE_MIN + 4,
-                     (log.content_size.width or log.size.width or 60) - 1)
+        pane_w = max(BUBBLE_MIN + 4, (pane.content_size.width or 60) - 1)
         bubble_w = max(BUBBLE_MIN, int(pane_w * BUBBLE_FRAC))
-        log.min_width = min(10, pane_w)
 
-        log.write(Text(pretty_addr(t["addr"]), style="bold"))
-        log.write("")
+        widgets.append(Static(Text(pretty_addr(t["addr"]), style="bold")))
 
         day = None
         for m in msgs:
-            t = datetime.fromtimestamp(m.get("rx", 0))
-            if t.date() != day:
-                day = t.date()
-                label = t.strftime("%A, %B %-d")
-                if t.year != datetime.now().year:
-                    label = t.strftime("%A, %B %-d, %Y")
-                log.write(date_rule(label, pane_w))
+            when_ = datetime.fromtimestamp(m.get("rx", 0))
+            if when_.date() != day:
+                day = when_.date()
+                label = when_.strftime("%A, %B %-d")
+                if when_.year != datetime.now().year:
+                    label = when_.strftime("%A, %B %-d, %Y")
+                widgets.append(Static(date_rule(label, pane_w)))
 
             outgoing = m.get("dir") == "out"
             body = m.get("body") or "(no body stored)"
-            label = t.strftime("%H:%M")
+            tag = when_.strftime("%H:%M")
             if m.get("code"):
-                label += f"  •  code {m['code']}"
+                tag += f"  •  code {m['code']}"
             if m.get("kind") != "sms":
-                label += f"  •  {m.get('kind')}"
+                tag += f"  •  {m.get('kind')}"
 
-            # Cap the bubble instead of letting it span the pane. expand=False only
-            # hugs SHORT content; a long message still fills the full width and stops
-            # looking like a message at all. Capping leaves the opposite margin
-            # visible, which is what makes the left/right distinction readable.
             bubble = Panel(
                 Text(body),
-                title=label,
+                title=tag,
                 title_align="right" if outgoing else "left",
                 border_style="cyan" if outgoing else "green",
                 expand=False,
@@ -478,21 +502,13 @@ class BridgeTUI(App):
                 padding=(0, 1),
             )
             if outgoing:
-                # Measure, then pad: right alignment computed from the bubble's real
-                # rendered width. No fixed indent -- a short message pins to the right
-                # edge and a long one uses the full pane, so nothing is wasted.
                 w = min(pane_w, Measurement.get(
                     _MEASURE, _MEASURE.options.update_width(pane_w), bubble).maximum)
-                log.write(Padding(bubble, (0, 0, 0, max(0, pane_w - w))))
+                widgets.append(Static(Padding(bubble, (0, 0, 0, max(0, pane_w - w)))))
             else:
-                log.write(bubble)
+                widgets.append(Static(bubble))
 
-            # Attachments under the bubble: drawn if we hold the bytes, described if
-            # not, so a skipped 30 MB video still shows that something was sent.
             for part in (m.get("parts") or []):
-                # Thumbnail first: it is what a half-block render can actually show,
-                # and the desktop holds every one of them. The original is fetched
-                # only when something wants it at full size.
                 shown = None
                 for key in ("thumb", "sha"):
                     d = part.get(key)
@@ -500,14 +516,32 @@ class BridgeTUI(App):
                         shown = d
                         break
                 if shown and str(part.get("mime", "")).startswith("image/"):
-                    art = images.render(store.attachment_path(shown),
-                                        max_w=min(bubble_w, 48), max_h=14)
-                    log.write(Padding(art, (0, 0, 0, 0 if outgoing else 2)))
+                    if ImageWidget is not None:
+                        # Real pixels where the terminal supports them: the widget
+                        # negotiates sixel/kitty itself and falls back to half cells.
+                        path = store.attachment_path(shown)
+                        iw = ImageWidget(str(path))
+                        iw.add_class("bridge-img")
+                        # Height computed from the image's own proportions rather than
+                        # pinned (which squashed every picture into the same square) or
+                        # left auto (which asks the terminal for its cell size -- fine
+                        # in a real terminal, zero anywhere without a tty).
+                        cols, rows = images.fit(path, min(bubble_w, IMG_W), IMG_MAX_H)
+                        iw.styles.width = cols
+                        iw.styles.height = rows
+                        widgets.append(iw)
+                    else:
+                        widgets.append(Static(images.render_blocks(
+                            store.attachment_path(shown),
+                            max_w=min(bubble_w, IMG_W), max_h=IMG_H)))
                 elif part.get("sha") and str(part.get("mime", "")).startswith("image/"):
-                    log.write(Text("  " + images.describe(part) + "  — f to fetch",
-                                   style="dim"))
+                    widgets.append(Static(Text(
+                        "  " + images.describe(part) + "  — f to fetch", style="dim")))
                 else:
-                    log.write(Text("  " + images.describe(part), style="dim"))
+                    widgets.append(Static(Text("  " + images.describe(part), style="dim")))
+
+        pane.mount_all(widgets)
+        pane.scroll_end(animate=False)
 
     # --------------------------------------------------------------- actions
 
@@ -601,6 +635,51 @@ class BridgeTUI(App):
                     + (f" of {len(want)}" if len(want) > FETCH_LIMIT else "")
                     + " — arrives on the phone's next poll", timeout=6)
         self.refresh_status()
+
+    def action_open_images(self) -> None:
+        """Open this conversation's pictures in the desktop image viewer.
+
+        A terminal is a poor place to look at a photograph: half blocks give two
+        pixels a cell, so even the whole pane is a couple of thousand pixels. The
+        inline render answers "is there a picture and roughly what"; this answers
+        "what is it". Prefers the full original when held, falls back to the
+        thumbnail, and says so rather than silently showing the small one.
+        """
+        t = getattr(self, "selected_thread", None)
+        if not t:
+            return
+        tid = t.get("thread")
+        paths, thumbs_only, missing = [], 0, 0
+        for m in sorted((x for x in store.messages()
+                         if tid is None or x.get("thread") == tid),
+                        key=lambda x: -x.get("rx", 0)):
+            for p in (m.get("parts") or []):
+                if not str(p.get("mime", "")).startswith("image/"):
+                    continue
+                full, thumb = p.get("sha"), p.get("thumb")
+                if full and store.has_attachment(full):
+                    paths.append(store.attachment_path(full))
+                elif thumb and store.has_attachment(thumb):
+                    paths.append(store.attachment_path(thumb))
+                    thumbs_only += 1
+                else:
+                    missing += 1
+            if len(paths) >= OPEN_LIMIT:
+                break
+
+        if not paths:
+            self.notify("No images held for this conversation — f to fetch", timeout=5)
+            return
+        try:
+            subprocess.Popen(["xdg-open", str(paths[0])],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.notify(f"Could not open: {e.__class__.__name__}", timeout=5)
+            return
+        note = f"Opened {paths[0].name[:12]}…"
+        if thumbs_only:
+            note += f" ({thumbs_only} of these are thumbnails — f for originals)"
+        self.notify(note, timeout=6)
 
     def action_junk(self) -> None:
         self._verdict(True)
