@@ -298,6 +298,10 @@ class H(http.server.BaseHTTPRequestHandler):
                    "code": extract(body), "backfilled": True}
             if m.get("thread") is not None:
                 rec["thread"] = m["thread"]
+            # Backfill carries part digests without bytes; dropping them here is what
+            # made a re-run upload images and then keep no reference to them.
+            if isinstance(m.get("parts"), list) and m["parts"]:
+                rec["parts"] = m["parts"]
             if BODIES:
                 rec["body"] = body
             if rec["id"]:
@@ -306,7 +310,8 @@ class H(http.server.BaseHTTPRequestHandler):
         res = store.add_messages(recs)
         # No notification and no code view update: these are historic, and popping a
         # desktop notification for a two-year-old 2FA code would be absurd.
-        print(f"backfill batch: {res['stored']} stored, {res['duplicates']} dup", flush=True)
+        print(f"backfill batch: {res['stored']} stored, {res['duplicates']} dup"
+              + (f", {res['enriched']} enriched" if res.get("enriched") else ""), flush=True)
         return self._reply(200, {"ok": True, **res, "total": len(store.messages())})
 
     def _ack(self):
@@ -323,6 +328,26 @@ class H(http.server.BaseHTTPRequestHandler):
         return self._reply(200, res)
 
     # ------------------------------------------------------------------- GET
+
+    def do_HEAD(self):
+        """Existence probe for an attachment.
+
+        The phone's backfill is resumable per conversation, so an interrupted run
+        repeats a thread. Without a probe it would re-send every image in it; with
+        one, resuming costs a round trip per part instead of the bytes.
+        """
+        path = urlparse(self.path).path.rstrip("/")
+        if not self._auth():
+            return self._reply(401)
+        if path.startswith("/attachments/"):
+            held = store.has_attachment(path.rsplit("/", 1)[-1])
+            self.send_response(200 if held else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         u = urlparse(self.path)

@@ -63,6 +63,7 @@ _MEASURE = Console(width=400, file=io.StringIO(), force_terminal=False)
 
 REFRESH_S = 3.0
 SHOW_LAST = 300          # newest messages rendered per conversation
+FETCH_LIMIT = 25         # images requested per keypress
 BUBBLE_FRAC = 0.82       # widest a bubble may get, as a fraction of the reading pane
 BUBBLE_MIN = 20          # narrow enough that a ~65 column pane still works
 PREVIEW_LINES = 2
@@ -283,6 +284,7 @@ class BridgeTUI(App):
         Binding("j", "junk", "Junk"),
         Binding("u", "not_junk", "Not junk"),
         Binding("Q", "show_junk", "Quarantine"),
+        Binding("f", "fetch", "Fetch images"),
     ]
 
     def __init__(self) -> None:
@@ -492,6 +494,10 @@ class BridgeTUI(App):
                     art = images.render(store.attachment_path(sha),
                                         max_w=min(bubble_w, 48), max_h=14)
                     log.write(Padding(art, (0, 0, 0, 0 if outgoing else 2)))
+                elif sha and str(part.get("mime", "")).startswith("image/"):
+                    # Held on the phone, not here. `f` asks for it.
+                    log.write(Text("  " + images.describe(part) + "  — f to fetch",
+                                   style="dim"))
                 else:
                     log.write(Text("  " + images.describe(part), style="dim"))
 
@@ -552,6 +558,36 @@ class BridgeTUI(App):
                     + pretty_addr(t["addr"]), timeout=4)
         self.threads = []
         self.reload()
+
+    def action_fetch(self) -> None:
+        """Request the images in this conversation that we do not hold.
+
+        Backfill deliberately records digests without bytes, so a historic picture
+        lives on the phone until it is asked for. Bounded per press: opening a
+        thousand-image thread must not queue a thousand transfers.
+        """
+        t = getattr(self, "selected_thread", None)
+        if not t:
+            return
+        tid = t.get("thread")
+        want = []
+        for m in store.messages():
+            if tid is not None and m.get("thread") != tid:
+                continue
+            for p in (m.get("parts") or []):
+                sha = p.get("sha")
+                if (sha and str(p.get("mime", "")).startswith("image/")
+                        and not store.has_attachment(sha)):
+                    want.append((sha, m["id"]))
+        if not want:
+            self.notify("Nothing to fetch in this conversation", timeout=4)
+            return
+        for sha, mid in want[:FETCH_LIMIT]:
+            store.enqueue("fetch_attachment", sha=sha, message=mid)
+        self.notify(f"Requested {min(len(want), FETCH_LIMIT)} image(s)"
+                    + (f" of {len(want)}" if len(want) > FETCH_LIMIT else "")
+                    + " — arrives on the phone's next poll", timeout=6)
+        self.refresh_status()
 
     def action_junk(self) -> None:
         self._verdict(True)

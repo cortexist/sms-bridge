@@ -81,6 +81,10 @@ OPS = {
     # Pull the phone's existing history into this archive. The phone owns paging and
     # its own resume cursor; this is just the go signal.
     "backfill":             (),              # -> BackfillWorker
+    # Ask the phone for one image by digest. Backfill records digests without bytes:
+    # a full history here is ~1,800 images and about 3 GB, almost none of it ever
+    # looked at. Fetching the one you open costs seconds.
+    "fetch_attachment":     ("sha", "message"),
     "send":                 ("addr", "body"),# -> SendNewMessage
 }
 
@@ -179,16 +183,32 @@ def add_messages(recs: list) -> dict:
     are the normal case rather than an error -- they are counted, not rejected.
     """
     _load()
-    fresh, dup = [], 0
+    fresh, dup, enriched = [], 0, {}
+    stored = {r.get("id"): r for r in _msgs if r.get("id")}
     seen = set(_ids)
     for r in recs:
         mid = r.get("id")
         if mid and mid in seen:
             dup += 1
+            # A re-run that now carries attachments must be able to ENRICH a record
+            # already held. Rejecting the duplicate wholesale uploaded the bytes and
+            # then dropped the reference to them, so the images existed and nothing
+            # pointed at them.
+            old = stored.get(mid)
+            if r.get("parts") and old is not None and not old.get("parts"):
+                merged = dict(old)
+                merged["parts"] = r["parts"]
+                enriched[mid] = merged
             continue
         if mid:
             seen.add(mid)
         fresh.append(r)
+
+    if enriched:
+        # One rewrite per batch rather than per record: the archive is append-only for
+        # writes, and this is the one path that has to go back and amend.
+        _rewrite(ARCHIVE, [enriched.get(r.get("id"), r) for r in _load()])
+
     if fresh:
         _ensure_dir()
         fd = os.open(ARCHIVE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -197,7 +217,7 @@ def add_messages(recs: list) -> dict:
                 f.write(json.dumps(r) + "\n")
             f.flush()
             os.fsync(f.fileno())
-    return {"stored": len(fresh), "duplicates": dup}
+    return {"stored": len(fresh), "duplicates": dup, "enriched": len(enriched)}
 
 
 def messages(since: int = 0, limit: int | None = None, addr: str | None = None) -> list:
