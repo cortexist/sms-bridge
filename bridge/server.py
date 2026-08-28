@@ -35,7 +35,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bridge import store  # noqa: E402
+from bridge import junk, store  # noqa: E402
 
 TOKEN = (store.DIR / "token").read_text().strip()
 BIND = os.environ.get("SMS2FA_BIND", "100.99.132.67")
@@ -131,6 +131,10 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._ack()
         if path == "/messages/bulk":
             return self._bulk()
+        if path == "/quarantine":
+            return self._quarantine()
+        if path == "/blocked":
+            return self._blocked()
         return self._reply(404, {"error": "not found"})
 
     def _ingest(self):
@@ -165,8 +169,80 @@ class H(http.server.BaseHTTPRequestHandler):
         print(f"{'stored' if fresh else 'duplicate'} from {sender}"
               f"{' (code)' if code else ''}", flush=True)
 
+        if fresh:
+            self._auto_classify(rec)
+
         # Piggyback: the response carries whatever the desktop queued.
         return self._reply(200, {"ok": True, "commands": store.pending()})
+
+    def _auto_classify(self, rec: dict) -> None:
+        """Score the thread a new message landed in.
+
+        Only ever writes an `auto` verdict, and only when nobody has ruled on the
+        conversation already: a human decision must never be overwritten by the
+        rules, or the corrections that make up the training set would evaporate.
+        """
+        key = ("t", rec["thread"]) if rec.get("thread") is not None \
+            else ("a", store.normalize_addr(rec["addr"]))
+        existing = store.verdicts().get(key)
+        if existing and existing.get("source") != "auto":
+            return
+
+        tid = rec.get("thread")
+        convo = [m for m in store.messages()
+                 if (tid is not None and m.get("thread") == tid)
+                 or (tid is None and store.normalize_addr(m.get("addr", ""))
+                     == store.normalize_addr(rec["addr"]))]
+        v = junk.classify(convo)
+        if v["junk"] and not (existing and existing["junk"]):
+            store.set_verdict(tid, rec["addr"], True, "auto", v["reasons"], v["score"])
+            print(f"quarantined {rec['addr']} ({', '.join(v['reasons'])})", flush=True)
+
+    def _quarantine(self):
+        """Desktop verdict: {thread, addr, junk}."""
+        obj, err = self._json_body()
+        if obj is None:
+            return err
+        rec = store.set_verdict(obj.get("thread"), str(obj.get("addr", "")),
+                                bool(obj.get("junk")),
+                                str(obj.get("source", "desktop")))
+        return self._reply(200, {"ok": True, "verdict": rec})
+
+    def _blocked(self):
+        """The phone's own block list, so marking junk there lands here too.
+
+        QUIK's block is app-local and reversible -- a quarantine in all but name --
+        which is why it can carry this without any new UI on the phone.
+        """
+        obj, err = self._json_body(cap=MAXBULK)
+        if obj is None:
+            return err
+        addrs = obj.get("addrs") or []
+        if not isinstance(addrs, list):
+            return self._reply(400, {"error": "addrs must be a list"})
+
+        # thread id per address, so a phone verdict keys the same way a desktop one does
+        thread_of = {}
+        for t in store.threads():
+            for a in t["addrs"]:
+                thread_of[store.normalize_addr(a)] = t["thread"]
+
+        current = store.verdicts()
+        added = 0
+        for a in addrs:
+            a = str(a)
+            norm = store.normalize_addr(a)
+            tid = thread_of.get(norm)
+            key = ("t", tid) if tid is not None else ("a", norm)
+            was = current.get(key)
+            if was and was["junk"] and was.get("source") == "phone":
+                continue                      # already recorded; keep the log quiet
+            if was and was.get("source") == "desktop" and not was["junk"]:
+                continue                      # desktop released it; do not re-flag
+            store.set_verdict(tid, a, True, "phone")
+            added += 1
+        print(f"phone block list: {added} new verdict(s) of {len(addrs)}", flush=True)
+        return self._reply(200, {"ok": True, "recorded": added, "received": len(addrs)})
 
     def _bulk(self):
         """Backfill ingest. One request per batch instead of one per message --
@@ -239,6 +315,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 addr=q.get("addr", [None])[0])})
         if path == "/commands":
             return self._reply(200, {"commands": store.pending()})
+        if path == "/quarantine":
+            return self._reply(200, {"verdicts": [
+                {"key": list(k), **v} for k, v in store.verdicts().items()]})
         return self._reply(404, {"error": "not found"})
 
     def log_message(self, *a):

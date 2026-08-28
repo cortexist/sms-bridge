@@ -53,7 +53,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
-from bridge import store
+from bridge import junk, store
 
 # Off-screen console purely for measuring how wide a bubble will actually render.
 # RichLog sizes a write to the renderable's OWN measured width, so Align.right never
@@ -280,6 +280,9 @@ class BridgeTUI(App):
         Binding("g", "top", "Newest"),
         Binding("c", "codes_only", "2FA only"),
         Binding("d", "delete", "Delete chain"),
+        Binding("j", "junk", "Junk"),
+        Binding("u", "not_junk", "Not junk"),
+        Binding("Q", "show_junk", "Quarantine"),
     ]
 
     def __init__(self) -> None:
@@ -288,6 +291,7 @@ class BridgeTUI(App):
         self.selected: str | None = None
         self.selected_thread: dict | None = None
         self.codes_only = False
+        self.show_junk = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -315,8 +319,16 @@ class BridgeTUI(App):
 
     def reload(self) -> None:
         rows = store.threads()
+        # Quarantined conversations leave the main list and appear only under Q.
+        # Hidden, never deleted -- the whole point of quarantine over blocking is
+        # that a wrong verdict costs a keystroke rather than a message.
+        verdicts = store.verdicts()
+        quarantined = {k for k, v in verdicts.items() if v["junk"]}
+        rows = [t for t in rows
+                if (store.verdict_key(t) in quarantined) == self.show_junk]
         if self.codes_only:
             rows = [t for t in rows if t["codes"]]
+        self._verdicts = verdicts
 
         # Rebuild only on a real change: a poll every few seconds must not yank the
         # selection out from under someone who is reading.
@@ -371,7 +383,11 @@ class BridgeTUI(App):
 
     def refresh_status(self) -> None:
         pend = store.pending()
-        bits = [f"{len(store.messages())} messages", f"{len(self.threads)} threads"]
+        nq = sum(1 for v in getattr(self, "_verdicts", {}).values() if v["junk"])
+        bits = [f"{len(store.messages())} messages",
+                f"{len(self.threads)} " + ("quarantined" if self.show_junk else "threads")]
+        if not self.show_junk and nq:
+            bits.append(f"{nq} in quarantine (Q)")
         if pend:
             # Surfaced, not hidden: nothing drains this queue until the phone-side
             # worker exists, so these will sit here.
@@ -506,6 +522,35 @@ class BridgeTUI(App):
             self.refresh_status()
 
         self.push_screen(ConfirmDelete(t["addr"], t["count"]), then)
+
+    def _verdict(self, junk_flag: bool) -> None:
+        t = getattr(self, "selected_thread", None)
+        if not t:
+            return
+        store.set_verdict(t.get("thread"), t["addr"], junk_flag, "desktop")
+        # Mirror it to the phone: QUIK's block is app-local and reversible, so the
+        # same conversation is hidden in both places without deleting anything.
+        try:
+            op = "mark_blocked" if junk_flag else "mark_unblocked"
+            if t.get("thread") is not None:
+                store.enqueue(op, threads=[t["thread"]])
+        except Exception:
+            pass
+        self.notify(("Quarantined " if junk_flag else "Released ")
+                    + pretty_addr(t["addr"]), timeout=4)
+        self.threads = []
+        self.reload()
+
+    def action_junk(self) -> None:
+        self._verdict(True)
+
+    def action_not_junk(self) -> None:
+        self._verdict(False)
+
+    def action_show_junk(self) -> None:
+        self.show_junk = not self.show_junk
+        self.threads = []
+        self.reload()
 
     def action_codes_only(self) -> None:
         self.codes_only = not self.codes_only

@@ -154,3 +154,47 @@ def classify(messages) -> dict:
         "has_code": has_code,
         "engaged": engaged,
     }
+
+
+def sweep(dry_run: bool = True) -> dict:
+    """Score every conversation already in the archive.
+
+    Auto-classification runs on ingest, so a backfilled history is never judged.
+    This is the one-off catch-up. It writes only `auto` verdicts and never touches
+    a conversation a person has already ruled on, in either direction.
+    """
+    from collections import defaultdict
+    from bridge import store
+
+    by_thread = defaultdict(list)
+    for m in store.messages():
+        by_thread[m.get("thread")].append(m)
+
+    verdicts = store.verdicts()
+    flagged, skipped = [], 0
+    for t in store.threads():
+        key = store.verdict_key(t)
+        prior = verdicts.get(key)
+        if prior and prior.get("source") != "auto":
+            skipped += 1
+            continue
+        v = classify(by_thread.get(t["thread"], []))
+        if not v["junk"]:
+            continue
+        flagged.append((t, v))
+        if not dry_run and not (prior and prior["junk"]):
+            store.set_verdict(t.get("thread"), t["addr"], True, "auto",
+                              v["reasons"], v["score"])
+    return {"flagged": flagged, "skipped_human": skipped, "dry_run": dry_run}
+
+
+if __name__ == "__main__":
+    import sys
+
+    apply = "--apply" in sys.argv
+    res = sweep(dry_run=not apply)
+    for t, v in res["flagged"]:
+        print("  %-16s n=%-4d %s" % (t["addr"][:16], t["count"], ",".join(v["reasons"])))
+    print("%s %d conversation(s); %d left alone (human verdict already)" % (
+        "quarantined" if apply else "would quarantine",
+        len(res["flagged"]), res["skipped_human"]))

@@ -38,6 +38,11 @@ DIR = Path(os.environ.get("SMS_BRIDGE_DIR", Path.home() / ".sms2fa"))
 ARCHIVE = DIR / "messages.jsonl"
 COMMANDS = DIR / "commands.jsonl"
 CODE_VIEW = DIR / "latest.json"
+# Quarantine verdicts, append-only like everything else. Each entry records who
+# decided -- "auto", "desktop", "phone" -- because the corrections are the labels
+# the rules have to learn from, and an auto verdict a human overrode is the most
+# valuable record in the file.
+VERDICTS = DIR / "quarantine.jsonl"
 
 # The command vocabulary is QUIK's interactor set, deliberately. The rule is that a
 # button in the TUI does what the identically-labelled button in the app does -- so
@@ -396,3 +401,49 @@ def ack(ids, results: dict | None = None) -> dict:
             older_than = min(older_than, int(time.time()) - int(c["args"]["days"]) * 86400)
     return {"acked": acked,
             "archive_removed": _forget(ids_, addrs_, threads_, older_than)}
+
+
+# ------------------------------------------------------------------ quarantine
+
+def set_verdict(thread, addr: str, junk: bool, source: str = "desktop",
+                reasons=None, score: int = 0) -> dict:
+    """Record a quarantine decision. Later entries win; history is kept."""
+    rec = {"v": 1, "at": int(time.time()), "thread": thread,
+           "addr": addr, "norm": normalize_addr(addr), "junk": bool(junk),
+           "source": source, "reasons": reasons or [], "score": score}
+    _append(VERDICTS, rec)
+    return rec
+
+
+def verdicts() -> dict:
+    """Current verdict per conversation, by replaying the log.
+
+    Keyed on thread id where there is one, normalised address otherwise -- the same
+    identity rule the thread list uses, so a verdict survives a thread being
+    relabelled or re-forwarded.
+    """
+    out = {}
+    for r in _read(VERDICTS):
+        key = ("t", r["thread"]) if r.get("thread") is not None else ("a", r.get("norm"))
+        out[key] = r
+    return out
+
+
+def verdict_key(t: dict):
+    return ("t", t["thread"]) if t.get("thread") is not None else ("a", t.get("norm"))
+
+
+def labels() -> dict:
+    """Human corrections only: the training set the rules do not have yet.
+
+    An auto verdict later overridden by a person is the interesting case, so both
+    the original and the correction are returned.
+    """
+    history, human = {}, {}
+    for r in _read(VERDICTS):
+        key = ("t", r["thread"]) if r.get("thread") is not None else ("a", r.get("norm"))
+        if r.get("source") == "auto":
+            history[key] = r
+        else:
+            human[key] = {"label": r, "overrode": history.get(key)}
+    return human
