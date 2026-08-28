@@ -53,7 +53,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
-from bridge import junk, store
+from bridge import images, junk, store
 
 # Off-screen console purely for measuring how wide a bubble will actually render.
 # RichLog sizes a write to the renderable's OWN measured width, so Align.right never
@@ -482,6 +482,18 @@ class BridgeTUI(App):
                 log.write(Padding(bubble, (0, 0, 0, max(0, pane_w - w))))
             else:
                 log.write(bubble)
+
+            # Attachments under the bubble: drawn if we hold the bytes, described if
+            # not, so a skipped 30 MB video still shows that something was sent.
+            for part in (m.get("parts") or []):
+                sha = part.get("sha")
+                if (sha and str(part.get("mime", "")).startswith("image/")
+                        and store.has_attachment(sha)):
+                    art = images.render(store.attachment_path(sha),
+                                        max_w=min(bubble_w, 48), max_h=14)
+                    log.write(Padding(art, (0, 0, 0, 0 if outgoing else 2)))
+                else:
+                    log.write(Text("  " + images.describe(part), style="dim"))
 
     # --------------------------------------------------------------- actions
 

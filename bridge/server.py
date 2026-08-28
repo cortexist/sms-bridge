@@ -23,6 +23,7 @@ the archive itself does not expire. Deliberate deletes now prune it (a TUI delet
 removes the row on ack), which helps, but is not the same as encryption.
 """
 
+import hashlib
 import hmac
 import http.server
 import json
@@ -135,6 +136,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._quarantine()
         if path == "/blocked":
             return self._blocked()
+        if path.startswith("/attachments/"):
+            return self._put_attachment(path.rsplit("/", 1)[-1])
         return self._reply(404, {"error": "not found"})
 
     def _ingest(self):
@@ -153,6 +156,10 @@ class H(http.server.BaseHTTPRequestHandler):
                "ts": int(msg.get("ts", now)), "rx": now, "addr": sender,
                "kind": str(msg.get("kind", "sms")), "sub": int(msg.get("sub", -1)),
                "code": code}
+        if msg.get("thread") is not None:
+            rec["thread"] = msg["thread"]
+        if isinstance(msg.get("parts"), list) and msg["parts"]:
+            rec["parts"] = msg["parts"]
         if BODIES:
             rec["body"] = body
 
@@ -197,6 +204,26 @@ class H(http.server.BaseHTTPRequestHandler):
         if v["junk"] and not (existing and existing["junk"]):
             store.set_verdict(tid, rec["addr"], True, "auto", v["reasons"], v["score"])
             print(f"quarantined {rec['addr']} ({', '.join(v['reasons'])})", flush=True)
+
+    def _put_attachment(self, sha: str):
+        """Raw bytes, content-addressed. Not JSON: an MMS image base64'd into a JSON
+        body would be a third larger for no benefit."""
+        n = int(self.headers.get("Content-Length", 0))
+        if n <= 0 or n > MAXBULK:
+            return self._reply(413, {"error": "bad length"})
+        data = self.rfile.read(n)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != sha:
+            # The name IS the integrity check; trusting the client's label would let
+            # a bad upload poison every message referencing that digest.
+            return self._reply(400, {"error": "digest mismatch"})
+        try:
+            fresh = store.put_attachment(sha, data)
+        except ValueError:
+            return self._reply(400, {"error": "bad digest"})
+        print(f"attachment {sha[:12]} {'stored' if fresh else 'already held'} "
+              f"({len(data)} bytes)", flush=True)
+        return self._reply(200 if fresh else 409, {"ok": True, "stored": fresh})
 
     def _quarantine(self):
         """Desktop verdict: {thread, addr, junk}."""
@@ -315,6 +342,21 @@ class H(http.server.BaseHTTPRequestHandler):
                 addr=q.get("addr", [None])[0])})
         if path == "/commands":
             return self._reply(200, {"commands": store.pending()})
+        if path.startswith("/attachments/"):
+            sha = path.rsplit("/", 1)[-1]
+            try:
+                p = store.attachment_path(sha)
+            except ValueError:
+                return self._reply(400, {"error": "bad digest"})
+            if not p.exists():
+                return self._reply(404, {"error": "not held"})
+            data = p.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/quarantine":
             return self._reply(200, {"verdicts": [
                 {"key": list(k), **v} for k, v in store.verdicts().items()]})

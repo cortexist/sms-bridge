@@ -30,6 +30,7 @@ the phone confirms it actually happened, so the two sides cannot silently diverg
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -43,6 +44,9 @@ CODE_VIEW = DIR / "latest.json"
 # the rules have to learn from, and an auto verdict a human overrode is the most
 # valuable record in the file.
 VERDICTS = DIR / "quarantine.jsonl"
+# Content-addressed MMS parts. The same picture forwarded twice is stored once, and
+# a retried upload cannot duplicate it.
+ATTACH = DIR / "attachments"
 
 # The command vocabulary is QUIK's interactor set, deliberately. The rule is that a
 # button in the TUI does what the identically-labelled button in the app does -- so
@@ -447,3 +451,32 @@ def labels() -> dict:
         else:
             human[key] = {"label": r, "overrode": history.get(key)}
     return human
+
+
+# ----------------------------------------------------------------- attachments
+
+def attachment_path(sha: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+        raise ValueError("not a sha256")          # never let a path element in
+    return ATTACH / sha
+
+
+def put_attachment(sha: str, data: bytes) -> bool:
+    """Store a part. False if it was already held -- content addressing makes a
+    duplicate upload a no-op rather than a conflict."""
+    p = attachment_path(sha)
+    if p.exists():
+        return False
+    ATTACH.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    tmp.chmod(0o600)
+    tmp.replace(p)
+    return True
+
+
+def has_attachment(sha: str) -> bool:
+    try:
+        return attachment_path(sha).exists()
+    except ValueError:
+        return False
