@@ -48,21 +48,36 @@ BODIES = os.environ.get("SMSBRIDGE_STORE_BODIES", "1") != "0"
 MAXBODY = 262144
 MAXBULK = 8 * 1024 * 1024
 
-# Prefer a digit run sitting near a word suggesting it is the code; fall back to any
-# plausible standalone run. Ordered most- to least-specific.
+# A CODE NEEDS A CODE WORD. The earlier fallback -- "any standalone 4-8 digit run" --
+# keyed 150 of 303 threads: years ("07/29/2026"), street numbers ("3707 S Oak Knoll"),
+# a port ("localhost:5000", 161 times), the tail of a phone number in a voicemail
+# transcript, a payment amount. Those reached the clipboard and the key avatar alike.
+# Digits alone say nothing; junk.looks_like_code already held this rule, extract() did not.
+#
+# Ordered most- to least-specific: digits right after a code word, digits right before
+# "is your", then any standalone 6-8 digit run provided a code word appears somewhere in
+# the message (a 4-5 digit run with the code word far away is still more often a year
+# or a house number than a code).
+CODEWORD = re.compile(r"\b(code|otp|passcode|verification|verify|2fa|one[- ]time|pin)\b", re.I)
 PATTERNS = [
-    re.compile(r"(?:code|otp|pin|passcode|verification|verify|2fa)\D{0,20}(\d{4,8})", re.I),
-    re.compile(r"(\d{4,8})\D{0,20}(?:is your|as your)", re.I),
-    re.compile(r"\b(\d{6})\b"),
-    re.compile(r"\b(\d{4,8})\b"),
+    re.compile(r"(?:code|otp|pin|passcode|verification|verify|2fa|one[- ]time)\W{0,3}"
+               r"(?:is|:|-|—)?\W{0,3}(?:[A-Z]-)?(\d{4,8})\b", re.I),
+    re.compile(r"(?:^|\W)(?:[A-Z]-)?(\d{4,8})\W{0,3}(?:is your|as your|to (?:confirm|verify|log))", re.I),
+    re.compile(r"(?<![\d$#*:.,/-])(\d{6,8})(?![\d%.,/-])"),
 ]
+YEAR = re.compile(r"^(19|20)\d\d$")
 
 
 def extract(body: str):
+    text = body or ""
+    if not CODEWORD.search(text):
+        return None
     for p in PATTERNS:
-        m = p.search(body or "")
-        if m:
-            return m.group(1)
+        for m in p.finditer(text):
+            digits = m.group(1)
+            if len(digits) == 4 and YEAR.match(digits):
+                continue                      # "expires 2026" is not a code
+            return digits
     return None
 
 
