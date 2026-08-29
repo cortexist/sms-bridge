@@ -294,7 +294,7 @@ def threads() -> list:
         key = ("t", tid) if tid is not None else ("a", norm)
 
         t = groups.setdefault(key, {"addr": r.get("addr") or "?", "count": 0, "last": 0,
-                                    "preview": "", "codes": 0, "thread": tid,
+                                    "preview": "", "codes": 0, "last_code": False, "thread": tid,
                                     "norm": norm, "addrs": set(), "in_addrs": set()})
         t["count"] += 1
         a = r.get("addr") or ""
@@ -310,6 +310,13 @@ def threads() -> list:
         if r.get("rx", 0) >= t["last"]:
             t["last"] = r.get("rx", 0)
             t["preview"] = (r.get("body") or "")[:120]
+        # A code is a per-message fact, so the key avatar follows the NEWEST inbound
+        # message only: a dedicated 2FA sender never sends anything else and keeps the
+        # key for good; a person or a shop that once sent a code loses it on their next
+        # text. "codes" (lifetime count) stays for the code filter and history.
+        if r.get("dir") != "out" and r.get("rx", 0) >= t.get("last_in", 0):
+            t["last_in"] = r.get("rx", 0)
+            t["last_code"] = bool(r.get("code"))
 
     out = []
     for t in groups.values():

@@ -63,7 +63,9 @@ PATTERNS = [
     re.compile(r"(?:code|otp|pin|passcode|verification|verify|2fa|one[- ]time)\W{0,3}"
                r"(?:is|:|-|—)?\W{0,3}(?:[A-Z]-)?(\d{4,8})\b", re.I),
     re.compile(r"(?:^|\W)(?:[A-Z]-)?(\d{4,8})\W{0,3}(?:is your|as your|to (?:confirm|verify|log))", re.I),
-    re.compile(r"(?<![\d$#*:.,/-])(\d{6,8})(?![\d%.,/-])"),
+    # A trailing "." or "," is only disqualifying when a digit follows it (a decimal or a
+    # thousands group); "...sign-in is 557762." is a code ending a sentence.
+    re.compile(r"(?<![\d$#*:.,/-])(\d{6,8})(?!\d|[%/-]|[.,]\d)"),
 ]
 YEAR = re.compile(r"^(19|20)\d\d$")
 

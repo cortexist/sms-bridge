@@ -159,14 +159,17 @@ AVATAR_COLOURS = ("cyan", "green", "magenta", "yellow", "blue", "red",
 def avatar(thread: dict) -> Text:
     """Exactly AVATAR_W cells on the left of every row.
 
-    A key for anything that has sent a 2FA code -- those are the threads worth
-    picking out at a glance. Everything else gets a coloured block for now; the
-    space is reserved so a real avatar can go here later without moving anything.
+    A key when the NEWEST inbound message is a 2FA code. A code is a per-message
+    fact, not a property of the sender: a dedicated 2FA server sends nothing but
+    codes, so it keeps the key permanently; a person or a shop that once sent a
+    code shows the key only until their next ordinary text. Everything else gets a
+    coloured block for now; the space is reserved so a real avatar can go here
+    later without moving anything.
 
     Padded by CELL width, not character count: the key emoji occupies two columns
     but is one character, so len() would size the column wrong.
     """
-    if thread["codes"]:
+    if thread.get("last_code"):
         t = Text("\U0001f511", style="yellow")
     else:
         key = thread.get("norm") or thread["addr"]
