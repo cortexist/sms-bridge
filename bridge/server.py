@@ -255,6 +255,14 @@ class H(http.server.BaseHTTPRequestHandler):
         addrs = obj.get("addrs") or []
         if not isinstance(addrs, list):
             return self._reply(400, {"error": "addrs must be a list"})
+        # Newer phones also send the blocked conversations with their thread ids --
+        # the identity verdicts are keyed on -- and treat the payload as the phone's
+        # COMPLETE block state, so a phone unblock releases here too. Older payloads
+        # (no "blocked" field) stay add-only: an absent list must not wipe verdicts.
+        blocked = obj.get("blocked")
+        complete = isinstance(blocked, list)
+        if not complete:
+            blocked = []
 
         # thread id per address, so a phone verdict keys the same way a desktop one does
         thread_of = {}
@@ -263,21 +271,50 @@ class H(http.server.BaseHTTPRequestHandler):
                 thread_of[store.normalize_addr(a)] = t["thread"]
 
         current = store.verdicts()
-        added = 0
-        for a in addrs:
-            a = str(a)
-            norm = store.normalize_addr(a)
-            tid = thread_of.get(norm)
-            key = ("t", tid) if tid is not None else ("a", norm)
+        added = released = 0
+        reported = set()
+
+        def flag(tid, a):
+            nonlocal added
+            key = ("t", tid) if tid is not None else ("a", store.normalize_addr(a))
+            reported.add(key)
             was = current.get(key)
             if was and was["junk"] and was.get("source") == "phone":
-                continue                      # already recorded; keep the log quiet
+                return                        # already recorded; keep the log quiet
             if was and was.get("source") == "desktop" and not was["junk"]:
-                continue                      # desktop released it; do not re-flag
+                return                        # desktop released it; do not re-flag
             store.set_verdict(tid, a, True, "phone")
             added += 1
-        print(f"phone block list: {added} new verdict(s) of {len(addrs)}", flush=True)
-        return self._reply(200, {"ok": True, "recorded": added, "received": len(addrs)})
+
+        for b in blocked:
+            if not isinstance(b, dict) or b.get("thread") is None:
+                continue
+            for a in b.get("addrs") or [str(b.get("addr", ""))]:
+                if str(a):
+                    flag(b["thread"], str(a))
+        # The flat list is the BlockedNumber table plus every blocked conversation's
+        # addresses; the latter were just recorded under their thread id, so recording
+        # them again keyed by address would only double the count in the log.
+        covered = {store.normalize_addr(str(a)) for b in blocked if isinstance(b, dict)
+                   for a in (b.get("addrs") or [])}
+        for a in addrs:
+            a = str(a)
+            if store.normalize_addr(a) in covered:
+                continue
+            flag(thread_of.get(store.normalize_addr(a)), a)
+
+        if complete:
+            # A phone-sourced junk verdict the phone no longer reports was unblocked
+            # there. Desktop/auto verdicts are not the phone's to release.
+            for key, was in current.items():
+                if key in reported or not was["junk"] or was.get("source") != "phone":
+                    continue
+                store.set_verdict(was.get("thread"), was.get("addr", ""), False, "phone")
+                released += 1
+        print(f"phone block list: {added} new verdict(s), {released} released, "
+              f"{len(blocked)} blocked conversations, {len(addrs)} addrs", flush=True)
+        return self._reply(200, {"ok": True, "recorded": added, "released": released,
+                                 "received": len(addrs)})
 
     def _bulk(self):
         """Backfill ingest. One request per batch instead of one per message --
