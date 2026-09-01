@@ -128,6 +128,11 @@ class H(http.server.BaseHTTPRequestHandler):
         return hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + TOKEN)
 
     def _reply(self, code: int, obj=None) -> None:
+        if code >= 400:
+            # Method, path and peer only -- never headers or bodies. Without this a
+            # phone posting with a stale token fails in total silence.
+            print(f"rejected {code}: {self.command} {urlparse(self.path).path} "
+                  f"from {self.client_address[0]}", flush=True)
         body = json.dumps(obj).encode() if obj is not None else b""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -328,10 +333,45 @@ class H(http.server.BaseHTTPRequestHandler):
                     continue
                 store.set_verdict(was.get("thread"), was.get("addr", ""), False, "phone")
                 released += 1
+        # Pins ride the same push, with the same rules blocked uses: the list is the
+        # phone's COMPLETE pin state (absent field = older phone, change nothing);
+        # "phone" entries follow it, and a "desktop" entry is not the phone's to undo
+        # until the phone has confirmed it -- a desktop pin awaiting its mark_pinned
+        # command must not flicker off, and a desktop unpin must not be re-pinned by
+        # a push that raced the mark_unpinned. The cost, as with blocked: after a
+        # desktop unpin, re-pinning that thread only works from the desktop.
+        pinned = obj.get("pinned")
+        p_added = p_removed = 0
+        if isinstance(pinned, list):
+            cur = store.pins()
+            reported_p = set()
+            for b in pinned:
+                if not isinstance(b, dict) or b.get("thread") is None:
+                    continue
+                a = next((str(x) for x in (b.get("addrs") or []) if str(x)), "")
+                key = ("t", b["thread"])
+                reported_p.add(key)
+                was = cur.get(key)
+                if was and was["pinned"] and was.get("source") == "phone":
+                    continue                  # already recorded
+                if was and not was["pinned"] and was.get("source") == "desktop":
+                    continue                  # desktop unpinned; awaiting mark_unpinned
+                store.set_pin(b["thread"], a, True, "phone")
+                p_added += 1
+            for key, was in cur.items():
+                if key in reported_p or not was["pinned"]:
+                    continue
+                if was.get("source") != "phone":
+                    continue                  # desktop pin; awaiting mark_pinned
+                store.set_pin(was.get("thread"), was.get("addr", ""), False, "phone")
+                p_removed += 1
         print(f"phone block list: {added} new verdict(s), {released} released, "
-              f"{len(blocked)} blocked conversations, {len(addrs)} addrs", flush=True)
+              f"{len(blocked)} blocked conversations, {len(addrs)} addrs"
+              + (f"; pins: +{p_added} -{p_removed}" if p_added or p_removed else ""),
+              flush=True)
         return self._reply(200, {"ok": True, "recorded": added, "released": released,
-                                 "received": len(addrs)})
+                                 "received": len(addrs),
+                                 "pins": {"added": p_added, "removed": p_removed}})
 
     def _bulk(self):
         """Backfill ingest. One request per batch instead of one per message --

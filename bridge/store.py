@@ -44,6 +44,7 @@ CODE_VIEW = DIR / "latest.json"
 # the rules have to learn from, and an auto verdict a human overrode is the most
 # valuable record in the file.
 VERDICTS = DIR / "quarantine.jsonl"
+PINS = DIR / "pins.jsonl"
 # Content-addressed MMS parts. The same picture forwarded twice is stored once, and
 # a retried upload cannot duplicate it.
 ATTACH = DIR / "attachments"
@@ -307,8 +308,12 @@ def threads() -> list:
                 t["in_addrs"].add(a)
         if r.get("code"):
             t["codes"] += 1
-        if r.get("rx", 0) >= t["last"]:
-            t["last"] = r.get("rx", 0)
+        # ts, not rx: the phone's message time is when it happened; rx is only when
+        # this box heard about it, hours later if delivery was queued behind an
+        # outage. The pre-v1 records have no ts, hence the fallback.
+        mt = r.get("ts") or r.get("rx", 0)
+        if mt >= t["last"]:
+            t["last"] = mt
             t["preview"] = (r.get("body") or "")[:120]
         # A code is a per-message fact, so the key avatar follows the NEWEST inbound
         # message only: a dedicated 2FA sender never sends anything else and keeps the
@@ -324,7 +329,13 @@ def threads() -> list:
         t["addrs"] = sorted(t["addrs"])
         t["in_addrs"] = sorted(t["in_addrs"])
         out.append(t)
-    return sorted(out, key=lambda t: t["last"], reverse=True)
+    cur_pins = pins()
+    for t in out:
+        p = cur_pins.get(verdict_key(t))
+        t["pinned"] = bool(p and p["pinned"])
+    # Pinned first, then newest. The pin bit comes from the same two-way sync the
+    # block list rides: the phone's pins push here, and a TUI pin is commanded back.
+    return sorted(out, key=lambda t: (not t["pinned"], -t["last"]))
 
 
 def code_since(since: int, ttl: int | None = None) -> dict | None:
@@ -449,6 +460,27 @@ def set_verdict(thread, addr: str, junk: bool, source: str = "desktop",
            "source": source, "reasons": reasons or [], "score": score}
     _append(VERDICTS, rec)
     return rec
+
+
+def set_pin(thread, addr: str, pinned: bool, source: str = "desktop") -> dict:
+    """Record a pin decision. Same append-and-replay shape as verdicts, and the same
+    source rules: "phone" entries follow the phone's complete pushed state, while a
+    "desktop" entry stands until the phone confirms it (its mark_pinned/mark_unpinned
+    command round-trips), so a pending pin cannot flicker off between drains."""
+    rec = {"v": 1, "at": int(time.time()), "thread": thread,
+           "addr": addr, "norm": normalize_addr(addr), "pinned": bool(pinned),
+           "source": source}
+    _append(PINS, rec)
+    return rec
+
+
+def pins() -> dict:
+    """Current pin per conversation, by replaying the log. Keyed like verdicts."""
+    out = {}
+    for r in _read(PINS):
+        key = ("t", r["thread"]) if r.get("thread") is not None else ("a", r.get("norm"))
+        out[key] = r
+    return out
 
 
 def verdicts() -> dict:

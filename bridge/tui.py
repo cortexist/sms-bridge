@@ -212,13 +212,18 @@ def thread_row(t: dict, width: int, index: int = 0) -> Group:
 
     stamp = when(t["last"])
     name = pretty_addr(t["addr"])
-    name_max = max(4, body_w - len(stamp) - 1)
+    # Single-cell glyph on purpose: the padding below counts with len(), and a
+    # double-width emoji would shift the timestamp column by one.
+    pin = "\u25c6 " if t.get("pinned") else ""
+    name_max = max(4, body_w - len(stamp) - 1 - len(pin))
     if len(name) > name_max:
         name = name[: name_max - 1] + "\u2026"
 
     head = Text(" " * AVATAR_W, no_wrap=True, overflow="crop")
+    if pin:
+        head.append(pin, style="bold yellow")
     head.append(name, style="bold")
-    head.append(" " * max(1, body_w - len(name) - len(stamp)))
+    head.append(" " * max(1, body_w - len(pin) - len(name) - len(stamp)))
     head.append(stamp, style="dim")
 
     preview = wrap(t["preview"], body_w, PREVIEW_LINES)
@@ -246,6 +251,24 @@ def thread_row(t: dict, width: int, index: int = 0) -> Group:
         if index % 2:
             ln.stylize(ROW_SHADE)
     return Group(*lines)
+
+
+class ThreadList(OptionList):
+    """OptionList with the wrap-around cursor removed.
+
+    Stock OptionList treats the list as a ring: cursor-down on the last row jumps
+    to the first. Harmless when the order is pure recency; with pinned threads
+    held at the top it turns "scrolled past the end" into "teleported back to the
+    pins", which reads as the list reshuffling itself. Clamp at the edges instead.
+    """
+
+    def action_cursor_down(self) -> None:
+        if self.highlighted is None or self.highlighted < self.option_count - 1:
+            super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self.highlighted is None or self.highlighted > 0:
+            super().action_cursor_up()
 
 
 class ChainPane(VerticalScroll):
@@ -327,6 +350,7 @@ class BridgeTUI(App):
         Binding("r", "reload", "Reload"),
         Binding("g", "top", "Newest"),
         Binding("c", "codes_only", "2FA only"),
+        Binding("p", "pin", "Pin/unpin"),
         Binding("d", "delete", "Delete chain"),
         Binding("j", "junk", "Junk"),
         Binding("u", "not_junk", "Not junk"),
@@ -346,7 +370,7 @@ class BridgeTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
-            yield OptionList(id="threads")
+            yield ThreadList(id="threads")
             yield ChainPane(id="convo")
         # Outside #body so it spans the window rather than being clipped to the
         # reading pane's width.
@@ -377,8 +401,8 @@ class BridgeTUI(App):
 
         # Rebuild only on a real change: a poll every few seconds must not yank the
         # selection out from under someone who is reading.
-        sig = [(t["addr"], t["count"], t["last"]) for t in rows]
-        if sig == [(t["addr"], t["count"], t["last"]) for t in self.threads]:
+        sig = [(t["addr"], t["count"], t["last"], t["pinned"]) for t in rows]
+        if sig == [(t["addr"], t["count"], t["last"], t.get("pinned")) for t in self.threads]:
             self.refresh_status()
             return
 
@@ -461,7 +485,10 @@ class BridgeTUI(App):
             aliases = set(t.get("addrs") or [t["addr"]])
             msgs = [m for m in store.messages()
                     if m.get("thread") is None and m.get("addr") in aliases]
-        msgs = sorted(msgs, key=lambda m: m.get("rx", 0))
+        # ts (phone message time), not rx (box sync time): a delivery delayed behind
+        # an outage arrives hours after it was sent, and showing the sync time both
+        # mislabels the bubble and misorders it against messages that synced promptly.
+        msgs = sorted(msgs, key=lambda m: m.get("ts") or m.get("rx", 0))
 
         widgets = []
         # Fewer than the RichLog version carried: every message is now one or more
@@ -479,7 +506,7 @@ class BridgeTUI(App):
 
         day = None
         for m in msgs:
-            when_ = datetime.fromtimestamp(m.get("rx", 0))
+            when_ = datetime.fromtimestamp(m.get("ts") or m.get("rx", 0))
             if when_.date() != day:
                 day = when_.date()
                 label = when_.strftime("%A, %B %-d")
@@ -560,6 +587,25 @@ class BridgeTUI(App):
     def action_top(self) -> None:
         if self.threads:
             self.query_one("#threads", OptionList).highlighted = 0
+
+    def action_pin(self) -> None:
+        """Toggle pin on the selected conversation, mirrored to the phone.
+
+        The desktop record takes effect here immediately; the mark_pinned /
+        mark_unpinned command reaches the phone on its next drain, and the phone's
+        pushed state then owns the entry (see store.set_pin). Address-only threads
+        from before backfill have no thread id to command, so those stay local.
+        """
+        t = self.selected_thread
+        if not t:
+            return
+        cur = store.pins().get(store.verdict_key(t))
+        now = not (cur and cur["pinned"])
+        store.set_pin(t.get("thread"), t["addr"], now, "desktop")
+        if t.get("thread") is not None:
+            store.enqueue("mark_pinned" if now else "mark_unpinned",
+                          threads=[t["thread"]])
+        self.reload()
 
     def action_delete(self) -> None:
         """Queue a whole-conversation delete, after confirming."""
