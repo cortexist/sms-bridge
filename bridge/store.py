@@ -87,7 +87,27 @@ OPS = {
     # looked at. Fetching the one you open costs seconds.
     "fetch_attachment":     ("sha", "message"),
     "send":                 ("addr", "body"),# -> SendNewMessage
+    # Ask the phone where it is. The answer rides in the ACK's `result`:
+    #   {"lat", "lon", "acc_m", "ts", "provider", "wifi_ssid", "wifi_bssid"}
+    # any field null when unknown (no fix, not on wifi). The wifi pair is the
+    # useful one: "phone is on the same access point as the box" is a perimeter
+    # test with no range error at all. Read by agents/utils/location.py.
+    "location":             (),
+    # Put a message in front of the human as an entry in an SMS thread from
+    # AGENT_ADDR: the phone INSERTS body into its inbox (no carrier involved), posts
+    # its normal new-message notification (so car consoles, watches and Android Auto
+    # see it like any text), and does NOT forward the inserted message back here.
+    # AGENT_ADDR is not dialable, so a reply typed into that thread is never handed
+    # to the radio; the phone POSTs it to /sms as dir=out, addr=AGENT_ADDR, which is
+    # the human->agent path. Enqueued by agents/utils/notify.py.
+    "notify":               ("body",),
 }
+
+# The sender the phone shows for agent notifications. Alphanumeric on purpose: it
+# cannot be a phone number, so nothing the human types into that thread can reach a
+# carrier. The receiver also never extracts a code from this address, so an agent
+# saying "confirmation 483920" cannot satisfy another agent's wait for a 2FA code.
+AGENT_ADDR = "AGENTS"
 
 
 # Two caches, both keyed on the archive's (mtime, size). At three records nothing
@@ -419,6 +439,31 @@ def all_commands() -> list:
         d["status"] = "applied" if cid in acked else "pending"
         out.append(d)
     return sorted(out, key=lambda c: c["created"], reverse=True)
+
+
+def acked(op: str, limit: int = 20) -> list:
+    """Applied commands of one op, each with its ack record, newest ack first."""
+    cmds, acks = {}, {}
+    for r in _read(COMMANDS):
+        if r.get("type") == "cmd" and r.get("op") == op:
+            cmds[r["id"]] = r
+        elif r.get("type") == "ack":
+            acks[r.get("id")] = r
+    out = [{"cmd": c, "ack": acks[cid]} for cid, c in cmds.items() if cid in acks]
+    return sorted(out, key=lambda x: x["ack"].get("at", 0), reverse=True)[:limit]
+
+
+def latest_location() -> dict | None:
+    """The newest location the phone reported, or None if it never has.
+
+    `at` is when the ack landed here (box clock); `ts` inside is the fix time on
+    the phone's clock. A phone that acked without a payload yields a dict with
+    only `at` and `cmd`, which callers treat as "no fix"."""
+    for x in acked("location", limit=1):
+        res = x["ack"].get("result")
+        res = res if isinstance(res, dict) else {}
+        return {**res, "at": x["ack"].get("at"), "cmd": x["cmd"]["id"]}
+    return None
 
 
 def ack(ids, results: dict | None = None) -> dict:

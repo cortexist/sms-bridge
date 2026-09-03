@@ -57,6 +57,7 @@ reboots; without a stable id every retry duplicates.
 | `GET` | `/latest` | newest code within TTL — unchanged, existing callers keep working |
 | `GET` | `/code?since=<epoch>` | **the loop-closer.** Newest code received after `since` |
 | `GET` | `/messages?since=&limit=&addr=` | for the TUI |
+| `GET` | `/location` | newest phone location (the `result` of the last acked `location` command) |
 
 CLI: `--show` (unchanged), `--wait-code --since <epoch|now> --timeout <s>` — blocks until a
 code arrives, exits 0 with the code on stdout, exit 1 on timeout. That is the agent-facing call.
@@ -101,3 +102,31 @@ Box → phone → SMS needs the phone to accept inbound requests. **Put that lis
 not Termux.** QUIK is the default SMS app, already holds `SEND_SMS`, and starts on boot;
 Termux has no Termux:Boot installed, so its sshd stays down after a phone reboot until the app
 is opened by hand. The app is the reliable host for this channel; the terminal is not.
+
+## Agent → human: `notify` and `location`
+
+Two commands in the queue exist for agents that need to reach the human, not for the TUI.
+
+**`notify {body}`** — the phone inserts `body` into its own inbox as a message from `AGENTS`
+(`store.AGENT_ADDR`) and posts its ordinary new-message notification. No carrier is involved:
+it is a content-provider insert, which is what a car console (MAP), a watch and Android Auto
+read from. Contract for the phone side:
+
+- the inserted message is **not forwarded back** here (it did not arrive by radio);
+- `AGENTS` is alphanumeric and not dialable, so a reply typed into that thread is **never
+  handed to the radio**; the phone POSTs it to `/sms` as `dir: "out", addr: "AGENTS"` — that is
+  the human→agent channel, and the receiver never extracts a code from that address;
+- ack `result`: `{"message": <phone message id>}`.
+
+**`location`** — the phone answers in the ack `result`:
+`{"lat", "lon", "acc_m", "ts", "provider", "wifi_ssid", "wifi_bssid"}`, any field `null` when
+unknown. Use the cheapest fix available (last known / network) — this is a perimeter test, not
+navigation. The wifi pair matters most: being on the same access point as the box is a
+zero-error "at home".
+
+The gating lives on the box, in `agents/utils/location.py` + `notify.py`, with the perimeter
+config in `~/.agents/perimeter.json` (`enabled: false` turns the gate off and every notify goes
+through). Decision: same wifi as the box → home; else distance from the static home coordinate
+minus the fix's accuracy radius beyond the perimeter → away; a fix that straddles the perimeter
+or is too coarse → unknown, which sends by default (`when_unknown`), on the view that a spare
+text is cheaper than a missed one.

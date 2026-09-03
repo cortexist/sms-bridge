@@ -180,7 +180,8 @@ class H(http.server.BaseHTTPRequestHandler):
         body = str(msg.get("body", ""))
         sender = str(msg.get("addr") or msg.get("from") or "unknown")
         mid = msg.get("id") or f"legacy:{now}:{hash(body) & 0xffffffff:08x}"
-        code = extract(body)
+        # Agent notifications and the human's replies to them are never 2FA codes.
+        code = extract(body) if sender != store.AGENT_ADDR else None
 
         rec = {"v": 1, "id": str(mid), "dir": str(msg.get("dir", "in")),
                "ts": int(msg.get("ts", now)), "rx": now, "addr": sender,
@@ -469,6 +470,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 addr=q.get("addr", [None])[0])})
         if path == "/commands":
             return self._reply(200, {"commands": store.pending()})
+        if path == "/location":
+            return self._reply(200, store.latest_location() or {"error": "never reported"})
         if path.startswith("/attachments/"):
             sha = path.rsplit("/", 1)[-1]
             try:
