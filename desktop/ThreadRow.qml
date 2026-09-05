@@ -8,13 +8,13 @@ Rectangle {
     property bool current: false
     signal clicked()
     // Three lines of text, as a terminal would lay it out: half a line of air, the name,
-    // the preview, half a line of air, and the rule on the bottom edge -- so the row's
-    // highlight runs from rule to rule and the first row has its air above it.
+    // the preview, half a line of air -- so a row's highlight covers exactly its three lines
+    // and the first row has its air above it.
     readonly property real line: Theme.lineHeight
     implicitHeight: Math.round(3 * line)
     color: current ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18) : "transparent"
 
-    Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: Theme.border; color: Theme.muted; opacity: 0.5 }
+    // No rule between rows: the half line of air above and below each row separates them.
 
     Avatar {
         id: avatar

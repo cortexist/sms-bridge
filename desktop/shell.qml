@@ -167,7 +167,7 @@ ShellRoot {
                     anchors.left: parent.left; anchors.right: sendButton.left; anchors.margins: Theme.pad
                     anchors.verticalCenter: parent.verticalCenter; height: 24 + Theme.fontSize
                     color: Theme.background; border.width: Theme.border; border.color: Theme.muted
-                    radius: Theme.radius(36)
+                    radius: 0                       // the composer stays rectangular, whatever the control shape
                     TextField {
                         id: input
                         anchors.fill: parent; anchors.margins: 2
@@ -181,7 +181,7 @@ ShellRoot {
                 Rectangle {
                     id: sendButton
                     anchors.right: parent.right; anchors.rightMargin: Theme.pad; anchors.verticalCenter: parent.verticalCenter
-                    width: 52 + Theme.fontSize; height: 24 + Theme.fontSize; radius: Theme.radius(height)
+                    width: 52 + Theme.fontSize; height: 24 + Theme.fontSize; radius: 0
                     color: input.text.length ? Theme.accent : Theme.lighterBackground
                     border.width: input.text.length ? 0 : Theme.border; border.color: Theme.muted
                     property bool busy: false
