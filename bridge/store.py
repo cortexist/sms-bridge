@@ -414,6 +414,8 @@ def threads() -> list:
         if agent:
             t["name"] = agent["name"]
             t["agent"] = {k: agent[k] for k in ("id", "addr", "color", "shape")}
+        elif t["addr"] == AGENT_ADDR:
+            t["name"] = "Agents"          # the channel itself, from before agents had names
         out.append(t)
     cur_pins = pins()
     for t in out:

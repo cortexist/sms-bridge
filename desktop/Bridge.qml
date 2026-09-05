@@ -312,11 +312,12 @@ QtObject {
     function title(t) {
         if (!t) return ""
         if (t.agent) return t.agent.name || t.name || t.addr
-        if (t.addr === "AGENTS") return "Chief"
+        if (t.addr === "AGENTS") return t.name || "Agents"    // the legacy channel, not an entity
         return t.name || pretty(t.addr)
     }
     function initials(t) {
         if (!t) return "?"
+        if (t.addr === "AGENTS") return "@"                    // the channel: an address, not a face
         if (isAgent(t)) return "``"
         if (t.name) {
             const w = t.name.trim().split(/\s+/)
