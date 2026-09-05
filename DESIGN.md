@@ -58,6 +58,10 @@ reboots; without a stable id every retry duplicates.
 | `GET` | `/code?since=<epoch>` | **the loop-closer.** Newest code received after `since` |
 | `GET` | `/messages?since=&limit=&addr=` | for the TUI |
 | `GET` | `/location` | newest phone location (the `result` of the last acked `location` command) |
+| `GET` | `/commands?wait=N` | the queue, holding up to N s (≤30) until something is queued — the phone's live link |
+| `GET` | `/live` | the live hint: `{wanted, lan, bssids, ttl}` |
+| `GET` | `/instructions?since=&limit=` | what the human typed into the AGENTS thread (outbound to AGENTS) |
+| `POST` | `/presence` | a desktop app is open (touches `~/.sms2fa/presence`; the TUI does this directly) |
 
 CLI: `--show` (unchanged), `--wait-code --since <epoch|now> --timeout <s>` — blocks until a
 code arrives, exits 0 with the code on stdout, exit 1 on timeout. That is the agent-facing call.
@@ -119,10 +123,13 @@ read from. Contract for the phone side:
 - ack `result`: `{"message": <phone message id>}`.
 
 **`location`** — the phone answers in the ack `result`:
-`{"lat", "lon", "acc_m", "ts", "provider", "wifi_ssid", "wifi_bssid"}`, any field `null` when
-unknown. Use the cheapest fix available (last known / network) — this is a perimeter test, not
-navigation. The wifi pair matters most: being on the same access point as the box is a
-zero-error "at home".
+`{"wifi_ips": [...], "permission": "not-requested", "ts"}` plus the legacy fields
+`lat, lon, acc_m, provider, wifi_ssid, wifi_bssid` as `null`. Since app 4.4.3 the phone asks
+for no location permission (Play reviews background location as a feature in its own right),
+so the only signal is the phone's own wifi address: inside one of the box's subnets
+(`store.box_lan_networks()`) is a zero-error "at home"; anything else is "unknown", which
+sends by default. App builds up to 4.4.2 still report the access point and a GPS fix, and the
+classifier still honours them.
 
 The gating lives on the box, in `agents/utils/location.py` + `notify.py`, with the perimeter
 config in `~/.agents/perimeter.json` (`enabled: false` turns the gate off and every notify goes
@@ -130,3 +137,25 @@ through). Decision: same wifi as the box → home; else distance from the static
 minus the fix's accuracy radius beyond the perimeter → away; a fix that straddles the perimeter
 or is too coarse → unknown, which sends by default (`when_unknown`), on the view that a spare
 text is cheaper than a missed one.
+
+## The live link (human replying from the desk)
+
+Polling every fifteen minutes is fine for everything except a human who typed a reply on the
+computer and is now looking at the phone. That human is next to the phone, so the phone is on
+the same access point as the box — and that is the gate. Every `/commands` and `/sms` response
+carries a `live` hint: `wanted` (a desktop app touched `~/.sms2fa/presence` within `ttl`
+seconds), `lan` (the box's IPv4 subnets plus whatever subnets the open desktop reported with
+its presence, so a desktop on another machine counts as "here" too) and `bssids` (kept for
+app builds up to 4.4.2). When
+`wanted` is true and the phone's own wifi address lies in `lan`, the phone opens a foreground
+service that long-polls
+`/commands?wait=25`; a queued `send` then leaves within a second. When either condition ends
+the service stops and the queue is back to polling. The phone still initiates every connection
+and nothing listens on it; the only cost is a silent notification while the link is up.
+
+## Instructions (human → agent)
+
+A reply typed into the AGENTS thread on the phone is a real sent SMS in the phone's log that the
+radio never saw; the phone forwards it as `dir: "out", addr: "AGENTS"`. `/instructions` (or the
+archive file) lists them. As with 2FA codes, the bridge does not interpret them: an agent takes a
+watermark, waits for what arrives, and answers through `notify`, which lands in the same thread.

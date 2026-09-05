@@ -1,0 +1,94 @@
+"""The agents' identities, from the `agents` address book cached beside the contacts.
+
+Each agent on the box is a vCard in Radicale's `agents` collection -- a trackable entity
+with a name, a virtual SMS address, an avatar expressed as two parameters, and optionally
+a mailbox -- because an agent cannot act for a real person without being one. Custom fields:
+
+    X-SMS-ADDRESS   ides@agents      the thread the human talks to it in; never dialable
+    X-AGENT-COLOR   #9ece6a          avatar colour
+    X-AGENT-SHAPE   0..3             avatar shape (square, rounded, round, squircle)
+
+Standard FN, EMAIL, PHOTO and NOTE are used as they are. The chief (chief@agents) is the
+front desk: any agent without a card speaks through it. "AGENTS" is its legacy alias.
+"""
+
+import os
+from pathlib import Path
+
+from bridge import contacts
+
+VDIR = Path(os.environ.get("SMS_AGENTS_DIR", contacts.VDIR / "agents"))
+CHIEF = "chief@agents"
+LEGACY = "AGENTS"
+
+_cache: dict = {"stamp": None, "agents": []}
+
+
+def is_agent(addr: str | None) -> bool:
+    a = (addr or "").strip().lower()
+    return a == LEGACY.lower() or a.endswith("@agents")
+
+
+def _parse(text: str) -> dict | None:
+    fn, addr, color, shape, email, note = "", "", "", None, "", ""
+    for line in contacts._unfold(text):
+        key, _, value = line.partition(":")
+        name = key.split(";")[0].upper()
+        v = value.strip()
+        if name == "FN": fn = v
+        elif name == "X-SMS-ADDRESS": addr = v.lower()
+        elif name == "X-AGENT-COLOR": color = v
+        elif name == "X-AGENT-SHAPE": shape = int(v) if v.isdigit() else None
+        elif name == "EMAIL" and not email: email = v
+        elif name == "NOTE": note = v.replace("\\n", "\n").replace("\\,", ",")
+    if not fn or not addr:
+        return None
+    return {"id": addr.split("@")[0], "addr": addr, "name": fn, "color": color or "#7aa2f7",
+            "shape": shape if shape is not None else 0, "email": email, "note": note}
+
+
+def _load() -> None:
+    try:
+        files = sorted(VDIR.glob("*.vcf"))
+        stamp = (len(files), max((f.stat().st_mtime for f in files), default=0))
+    except OSError:
+        files, stamp = [], None
+    if stamp == _cache["stamp"]:
+        return
+    agents = []
+    for f in files:
+        try:
+            card = _parse(f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if card:
+            agents.append(card)
+    _cache.update(stamp=stamp, agents=agents)
+
+
+def all_agents() -> list:
+    _load()
+    return list(_cache["agents"])
+
+
+def lookup(key: str | None) -> dict | None:
+    """By short id ("ides"), address ("ides@agents") or the legacy AGENTS alias."""
+    if not key:
+        return None
+    k = key.strip().lower()
+    if k == LEGACY.lower():
+        k = CHIEF
+    _load()
+    for a in _cache["agents"]:
+        if k in (a["id"], a["addr"]):
+            return a
+    return None
+
+
+def chief() -> dict:
+    return lookup(CHIEF) or {"id": "chief", "addr": CHIEF, "name": "Chief", "color": "#7aa2f7", "shape": 0, "email": "", "note": ""}
+
+
+def identity(key: str | None) -> dict:
+    """The identity a message should be sent under: the agent's own card, else the chief."""
+    return lookup(key) or chief()

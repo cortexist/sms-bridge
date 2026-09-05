@@ -48,6 +48,10 @@ PINS = DIR / "pins.jsonl"
 # Content-addressed MMS parts. The same picture forwarded twice is stored once, and
 # a retried upload cannot duplicate it.
 ATTACH = DIR / "attachments"
+# Touched by a desktop app while it is open (the TUI does it on every refresh). Its
+# mtime is the "a human is at the desk" signal behind the phone's live link.
+PRESENCE = DIR / "presence"
+PRESENCE_TTL = 60
 
 # The command vocabulary is QUIK's interactor set, deliberately. The rule is that a
 # button in the TUI does what the identically-labelled button in the app does -- so
@@ -82,6 +86,7 @@ OPS = {
     # Pull the phone's existing history into this archive. The phone owns paging and
     # its own resume cursor; this is just the go signal.
     "backfill":             (),              # -> BackfillWorker
+    "forward_threads":      ("threads",),    # -> ForwardMessageWorker for one conversation
     # Ask the phone for one image by digest. Backfill records digests without bytes:
     # a full history here is ~1,800 images and about 3 GB, almost none of it ever
     # looked at. Fetching the one you open costs seconds.
@@ -93,6 +98,9 @@ OPS = {
     # useful one: "phone is on the same access point as the box" is a perimeter
     # test with no range error at all. Read by agents/utils/location.py.
     "location":             (),
+    # Diagnostics: what the phone decided about the live link and from what
+    # (its wifi addresses, BSSID, the last hint it saw, the last error).
+    "live_status":          (),
     # Put a message in front of the human as an entry in an SMS thread from
     # AGENT_ADDR: the phone INSERTS body into its inbox (no carrier involved), posts
     # its normal new-message notification (so car consoles, watches and Android Auto
@@ -100,6 +108,8 @@ OPS = {
     # AGENT_ADDR is not dialable, so a reply typed into that thread is never handed
     # to the radio; the phone POSTs it to /sms as dir=out, addr=AGENT_ADDR, which is
     # the human->agent path. Enqueued by agents/utils/notify.py.
+    # args: body, and optionally addr (the agent's address, default chief@agents), name,
+    # color, shape -- the identity the phone files the message under.
     "notify":               ("body",),
 }
 
@@ -121,7 +131,7 @@ AGENT_ADDR = "AGENTS"
 # Safe because the server process is the only writer of messages; the TUI only ever
 # appends commands. Any rewrite (deletion, prune) invalidates by changing mtime/size.
 _cache_key = None
-_ids: set = set()
+_ids: dict = {}      # archive id -> message ts; an id seen again with a DIFFERENT ts is a reused id
 _msgs: list = []
 
 
@@ -139,7 +149,7 @@ def _load() -> list:
     key = _stat_key()
     if key != _cache_key:
         _msgs = list(_read(ARCHIVE))
-        _ids = {r.get("id") for r in _msgs if r.get("id")}
+        _ids = {r["id"]: r.get("ts") for r in _msgs if r.get("id")}
         _cache_key = key
     return _msgs
 
@@ -187,14 +197,33 @@ def _rewrite(path: Path, records) -> None:
 
 # -------------------------------------------------------------------- messages
 
-def add_message(rec: dict) -> bool:
-    """Append a message. False if its id was already stored (a retry)."""
+def resolve_id(mid: str, ts) -> tuple[str, bool]:
+    """(archive id, already stored) for an incoming (id, ts).
+
+    The phone's ids are not unique across time: its internal numbering restarts on a
+    full resync, and the provider reuses row ids after deletions. A retry carries the
+    same id AND the same ts; a reused id carries a different ts, and is stored under
+    `<id>@<ts>` so both messages keep distinct archive ids.
+    """
     _load()
-    mid = rec.get("id")
-    if mid and mid in _ids:
-        return False
-    _append(ARCHIVE, rec)
-    return True
+    if not mid:
+        return mid, False
+    if mid not in _ids:
+        return mid, False
+    if ts is None or _ids[mid] == ts:
+        return mid, True
+    alt = f"{mid}@{ts}"
+    return alt, alt in _ids
+
+
+def add_message(rec: dict) -> str | None:
+    """Append a message; returns the archive id it was stored under, or None if it was
+    already there (a retry)."""
+    aid, dup = resolve_id(rec.get("id"), rec.get("ts"))
+    if dup:
+        return None
+    _append(ARCHIVE, {**rec, "id": aid} if aid != rec.get("id") else rec)
+    return aid
 
 
 def add_messages(recs: list) -> dict:
@@ -207,8 +236,18 @@ def add_messages(recs: list) -> dict:
     fresh, dup, enriched = [], 0, {}
     stored = {r.get("id"): r for r in _msgs if r.get("id")}
     seen = set(_ids)
+    # Content identity as well as id: the phone's id scheme has changed once already
+    # (Realm ids, then provider row ids), and a fresh install backfills everything under
+    # ids the archive has never seen. The same address, direction, second and text is
+    # the same message whatever it is numbered. Observed 2026-09-05: 3,302 duplicates
+    # in one run before this check existed.
+    content = lambda r: (r.get("addr"), r.get("dir"), r.get("ts"), r.get("body") or "")
+    held = {content(r) for r in _msgs if r.get("type") is None}
     for r in recs:
         mid = r.get("id")
+        if mid and mid not in seen and content(r) in held:
+            dup += 1
+            continue
         if mid and mid in seen:
             dup += 1
             # A re-run that now carries attachments must be able to ENRICH a record
@@ -228,6 +267,7 @@ def add_messages(recs: list) -> dict:
             continue
         if mid:
             seen.add(mid)
+        held.add(content(r))
         fresh.append(r)
 
     if enriched:
@@ -246,9 +286,23 @@ def add_messages(recs: list) -> dict:
     return {"stored": len(fresh), "duplicates": dup, "enriched": len(enriched)}
 
 
-def messages(since: int = 0, limit: int | None = None, addr: str | None = None) -> list:
-    out = [r for r in _load()
-           if r.get("rx", 0) >= since and (addr is None or r.get("addr") == addr)]
+def messages(since: int = 0, limit: int | None = None, addr: str | None = None,
+             thread: int | None = None, addrs: list | None = None) -> list:
+    """`addr` is an exact match; `thread`/`addrs` select a conversation the way threads()
+    groups it (the phone's thread id where a record has one, the address otherwise)."""
+    def wanted(r):
+        if r.get("rx", 0) < since:
+            return False
+        if addr is not None and r.get("addr") != addr:
+            return False
+        if thread is not None or addrs:
+            return (thread is not None and r.get("thread") == thread) or \
+                   (bool(addrs) and r.get("addr") in addrs)
+        return True
+    # In time order, not file order: an agent's notify is recorded when the phone acks
+    # it, which can land after a reply the human already typed to it.
+    out = sorted((r for r in _load() if wanted(r)),
+                 key=lambda r: (r.get("ts") or r.get("rx") or 0, r.get("rx") or 0))
     return out[-limit:] if limit else out
 
 
@@ -279,8 +333,8 @@ def display_addr(addrs, incoming=()) -> str:
 def normalize_addr(a: str) -> str:
     """Grouping key for an address.
 
-    The same person arrives written several ways -- +18472261218, 18472261218,
-    8472261218, and +15614097922@one.att.net for an email-gatewayed MMS. Grouping on
+    The same person arrives written several ways -- +18475550100, 18475550100,
+    8475550100, and +18475550100@mms.example.net for an email-gatewayed MMS. Grouping on
     the raw string split one contact across three list entries in the backfill.
     """
     a = (a or "").split("@")[0]                 # email-gatewayed MMS
@@ -335,6 +389,9 @@ def threads() -> list:
         if mt >= t["last"]:
             t["last"] = mt
             t["preview"] = (r.get("body") or "")[:120]
+            # The list shows a failed last send (a red badge, like the phone's list).
+            t["last_failed"] = r.get("dir") == "out" and r.get("status") == "failed"
+            t["last_out"] = r.get("dir") == "out"
         # A code is a per-message fact, so the key avatar follows the NEWEST inbound
         # message only: a dedicated 2FA sender never sends anything else and keeps the
         # key for good; a person or a shop that once sent a code loses it on their next
@@ -343,11 +400,20 @@ def threads() -> list:
             t["last_in"] = r.get("rx", 0)
             t["last_code"] = bool(r.get("code"))
 
+    from bridge import contacts
     out = []
     for t in groups.values():
         t["addr"] = display_addr(t["addrs"], t["in_addrs"])
         t["addrs"] = sorted(t["addrs"])
         t["in_addrs"] = sorted(t["in_addrs"])
+        # A card name when the vdir has one for any address in the thread; None otherwise.
+        t["name"] = contacts.name_for_any(t["in_addrs"]) or contacts.name_for_any(t["addrs"])
+        t["photo"] = contacts.photo_for_any(t["in_addrs"]) or contacts.photo_for_any(t["addrs"])
+        from bridge import agents as ag
+        agent = ag.lookup(t["addr"]) if ag.is_agent(t["addr"]) else None
+        if agent:
+            t["name"] = agent["name"]
+            t["agent"] = {k: agent[k] for k in ("id", "addr", "color", "shape")}
         out.append(t)
     cur_pins = pins()
     for t in out:
@@ -466,6 +532,175 @@ def latest_location() -> dict | None:
     return None
 
 
+# -------------------------------------------------------------------- presence / live link
+
+def touch_presence(lan: list | None = None) -> None:
+    """A desktop app is open. Call every few seconds while it is; stop when it closes.
+
+    `lan` is the desktop's own IPv4 subnets, for a desktop on another machine (a laptop
+    away from home): the phone opens the live link when it is on the same network as
+    whichever desktop is open, not only this box. Kept in the presence file for as long
+    as the presence itself; tailnet, loopback and link-local ranges are ignored."""
+    _ensure_dir()
+    nets = []
+    for n in lan or ():
+        try:
+            import ipaddress
+            net = ipaddress.ip_network(str(n), strict=False)
+        except ValueError:
+            continue
+        if net.version != 4 or net.prefixlen >= 32 or net.is_loopback or net.is_link_local \
+                or net.subnet_of(ipaddress.ip_network("100.64.0.0/10")):
+            continue
+        nets.append(str(net))
+    PRESENCE.write_text(json.dumps({"lan": nets}))
+
+
+def presence_lan() -> list:
+    """Subnets the open desktop(s) reported, while the presence is fresh."""
+    if not presence_active():
+        return []
+    try:
+        return list(json.loads(PRESENCE.read_text() or "{}").get("lan") or [])
+    except (OSError, ValueError):
+        return []
+
+
+def presence_active(ttl: int = PRESENCE_TTL) -> bool:
+    try:
+        return time.time() - PRESENCE.stat().st_mtime <= ttl
+    except FileNotFoundError:
+        return False
+
+
+_bssid_cache: tuple[float, list] = (0.0, [])
+
+
+def box_wifi_bssids() -> list:
+    """BSSIDs this box is connected to (nmcli), cached for a minute. Empty when not on wifi."""
+    global _bssid_cache
+    if time.time() - _bssid_cache[0] < 60:
+        return _bssid_cache[1]
+    out = []
+    try:
+        import subprocess
+        text = subprocess.run(["nmcli", "-t", "-f", "ACTIVE,BSSID", "dev", "wifi", "list", "--rescan", "no"],
+                              capture_output=True, text=True, timeout=10).stdout
+        for line in text.splitlines():
+            line = line.replace("\\:", "\0")
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[0] == "yes":
+                out.append(parts[1].replace("\0", ":").lower())
+    except Exception:
+        out = []
+    _bssid_cache = (time.time(), out)
+    return out
+
+
+LIVE_SEEN = DIR / "live-seen"   # touched by each long-poll: "the phone's live link is up"
+
+
+def mark_live_seen() -> None:
+    _ensure_dir()
+    LIVE_SEEN.touch()
+
+
+def live_link_age() -> float | None:
+    """Seconds since the phone last long-polled, or None if it never has."""
+    try:
+        return round(time.time() - LIVE_SEEN.stat().st_mtime, 1)
+    except FileNotFoundError:
+        return None
+
+
+_lan_cache: tuple[float, list] = (0.0, [])
+
+
+def box_lan_networks() -> list:
+    """The IPv4 subnets this box sits on, as a.b.c.d/nn, tailscale excluded. A phone
+    whose wifi address falls in one of them is on the same LAN -- no permission needed
+    on the phone to know its own address, unlike the BSSID."""
+    global _lan_cache
+    if time.time() - _lan_cache[0] < 60:
+        return _lan_cache[1]
+    out = []
+    try:
+        import ipaddress, subprocess
+        text = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                              capture_output=True, text=True, timeout=10).stdout
+        for line in text.splitlines():
+            f = line.split()
+            if len(f) >= 4 and not f[1].startswith(("tailscale", "docker", "veth", "lo")):
+                net = ipaddress.ip_interface(f[3]).network
+                if net.prefixlen < 32:
+                    out.append(str(net))
+    except Exception:
+        out = []
+    _lan_cache = (time.time(), out)
+    return out
+
+
+def set_status(mid: str, status: str, ts=None) -> bool:
+    """Update the delivery status of an outbound message already in the archive
+    (the phone forwards a message again when it fails to send). Resolved by (id, ts)
+    so a reused id can never touch an older message."""
+    aid, known = resolve_id(mid, ts)
+    if not known:
+        return False
+    changed = False
+    recs = []
+    for r in _read(ARCHIVE):
+        if r.get("id") == aid and r.get("dir") == "out" and r.get("status") != status:
+            r = {**r, "status": status}
+            changed = True
+        recs.append(r)
+    if changed:
+        _rewrite(ARCHIVE, recs)
+    return changed
+
+
+def live_hint() -> dict:
+    """What the phone needs to decide on a live link: is anyone at the desk, and which
+    access point counts as 'here'. Rides on every /commands and /sms response. `link`
+    is for the desktop side: how long ago the phone's long-poll was last seen."""
+    lan = box_lan_networks()
+    lan += [n for n in presence_lan() if n not in lan]
+    return {"wanted": presence_active(), "bssids": box_wifi_bssids(), "lan": lan,
+            "ttl": PRESENCE_TTL, "link": live_link_age()}
+
+
+# -------------------------------------------------------------------- agent instructions
+
+def instructions(since: int = 0, limit: int | None = None, agent: str | None = None) -> list:
+    """What the human typed into an agent's thread on the phone: outbound messages to an
+    agent address, oldest first. `agent` narrows to one identity (id or address); the
+    chief also receives what was typed into the legacy AGENTS thread. The bridge never
+    interprets them; an agent subscribes with a watermark and reads its window."""
+    from bridge import agents as ag
+    if agent:
+        ident = ag.identity(agent)
+        addrs = {ident["addr"]} | ({AGENT_ADDR} if ident["addr"] == ag.CHIEF else set())
+    else:
+        addrs = None
+    out = [m for m in messages(since=since) if m.get("dir") == "out" and ag.is_agent(m.get("addr"))
+           and (addrs is None or (m.get("addr") or "") in addrs)]
+    return out[-limit:] if limit else out
+
+
+def _record_notify(cmd: dict, result) -> None:
+    """An agent's message exists only on the phone unless we write it down here: the phone
+    does not forward what the box itself wrote (that would loop), so the archive learns it
+    at the ack, under the id the phone filed it as. Then the desktop and the TUI show the
+    agent's side of the conversation too."""
+    if not isinstance(result, dict) or not result.get("message"):
+        return
+    args = cmd.get("args") or {}
+    add_message({"v": 1, "id": str(result["message"]), "dir": "in", "ts": int(time.time()),
+                 "rx": int(time.time()), "addr": result.get("addr") or args.get("addr") or "chief@agents",
+                 "body": args.get("body", ""), "kind": "sms", "sub": -1, "code": None,
+                 "agent": True})
+
+
 def ack(ids, results: dict | None = None) -> dict:
     """Mark commands applied. Archive deletion happens HERE, not at enqueue.
 
@@ -484,6 +719,8 @@ def ack(ids, results: dict | None = None) -> dict:
         _append(COMMANDS, {"v": 1, "type": "ack", "id": cid, "at": int(time.time()),
                            "result": (results or {}).get(cid)})
         acked.append(cid)
+        if c["op"] == "notify":
+            _record_notify(c, (results or {}).get(cid))
         if c["op"] == "delete_messages":
             ids_.update(c["args"].get("ids") or [])
         elif c["op"] == "delete_conversations":

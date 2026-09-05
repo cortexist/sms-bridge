@@ -24,6 +24,7 @@ removes the row on ack), which helps, but is not the same as encryption.
 """
 
 import hashlib
+import base64
 import hmac
 import http.server
 import json
@@ -166,6 +167,24 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._quarantine()
         if path == "/blocked":
             return self._blocked()
+        if path == "/commands":
+            # The desktop app queues a command for the phone: {"op": ..., "args": {...}}.
+            body, err = self._json_body()
+            if body is None:
+                return err
+            try:
+                cmd = store.enqueue(str(body.get("op", "")), **(body.get("args") or {}))
+            except (ValueError, TypeError) as e:
+                return self._reply(400, {"error": str(e)})
+            return self._reply(200, {"ok": True, "command": cmd})
+        if path == "/presence":
+            # A desktop app announcing it is open, with its own subnets so a desktop on
+            # another machine can hold the live link too. Local callers may touch the file.
+            body, err = self._json_body()
+            if body is None:
+                return err
+            store.touch_presence(body.get("lan") if isinstance(body, dict) else None)
+            return self._reply(200, {"ok": True, "live": store.live_hint()})
         if path.startswith("/attachments/"):
             return self._put_attachment(path.rsplit("/", 1)[-1])
         return self._reply(404, {"error": "not found"})
@@ -181,7 +200,8 @@ class H(http.server.BaseHTTPRequestHandler):
         sender = str(msg.get("addr") or msg.get("from") or "unknown")
         mid = msg.get("id") or f"legacy:{now}:{hash(body) & 0xffffffff:08x}"
         # Agent notifications and the human's replies to them are never 2FA codes.
-        code = extract(body) if sender != store.AGENT_ADDR else None
+        from bridge import agents as ag
+        code = extract(body) if not ag.is_agent(sender) else None
 
         rec = {"v": 1, "id": str(mid), "dir": str(msg.get("dir", "in")),
                "ts": int(msg.get("ts", now)), "rx": now, "addr": sender,
@@ -194,7 +214,14 @@ class H(http.server.BaseHTTPRequestHandler):
         if BODIES:
             rec["body"] = body
 
-        fresh = store.add_message(rec)
+        stored_id = store.add_message(rec)
+        fresh = stored_id is not None
+        if fresh:
+            rec["id"] = stored_id
+        elif msg.get("status") and rec["dir"] == "out":
+            # A re-forward of an outbound message carrying its delivery status.
+            if store.set_status(rec["id"], str(msg["status"]), rec.get("ts")):
+                print(f"status {msg['status']} for {rec['id']}", flush=True)
 
         if code and fresh:
             tmp = store.CODE_VIEW.with_suffix(".tmp")
@@ -210,8 +237,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if fresh:
             self._auto_classify(rec)
 
-        # Piggyback: the response carries whatever the desktop queued.
-        return self._reply(200, {"ok": True, "commands": store.pending()})
+        # Piggyback: the response carries whatever the desktop queued, and the live hint.
+        return self._reply(200, {"ok": True, "commands": store.pending(), "live": store.live_hint()})
 
     def _auto_classify(self, rec: dict) -> None:
         """Score the thread a new message landed in.
@@ -464,14 +491,67 @@ class H(http.server.BaseHTTPRequestHandler):
             since = int(q.get("since", ["0"])[0])
             return self._reply(200, store.code_since(since) or {"error": "no code"})
         if path == "/messages":
+            thread = q.get("thread", [None])[0]
             return self._reply(200, {"messages": store.messages(
                 since=int(q.get("since", ["0"])[0]),
                 limit=int(q.get("limit", ["200"])[0]),
-                addr=q.get("addr", [None])[0])})
+                addr=q.get("addr", [None])[0],
+                thread=int(thread) if thread not in (None, "", "null") else None,
+                addrs=q.get("addrs", [None])[0].split(",") if q.get("addrs", [None])[0] else None)})
+        if path == "/contacts":
+            from bridge import contacts
+            return self._reply(200, {"contacts": contacts.all_cards()})
+        if path == "/threads":
+            # The desktop app's list: what the TUI shows, as JSON. Each thread carries
+            # its verdict (`junk`, with `junk_source`) so the desktop can quarantine the
+            # way the TUI does; a phone-side block arrives here as a phone verdict.
+            verdicts = store.verdicts()
+            out = []
+            for t in store.threads():
+                v = verdicts.get(store.verdict_key(t))
+                t["junk"] = bool(v and v.get("junk"))
+                t["junk_source"] = v.get("source") if v and v.get("junk") else None
+                out.append(t)
+            return self._reply(200, {"threads": out})
         if path == "/commands":
-            return self._reply(200, {"commands": store.pending()})
+            # ?wait=N holds the request up to N seconds (max 30) until something is
+            # queued: the phone's live link. A bare GET answers at once as before.
+            wait = min(max(int(q.get("wait", ["0"])[0]), 0), 30)
+            if wait:
+                store.mark_live_seen()
+            t0 = time.time()
+            deadline = t0 + wait
+            cmds = store.pending()
+            while not cmds and time.time() < deadline:
+                time.sleep(0.5)
+                cmds = store.pending()
+            live = store.live_hint()
+            # Peer, wait and timing only -- never the commands themselves.
+            print(f"commands GET from {self.client_address[0]} wait={wait} -> {len(cmds)} cmd(s), "
+                  f"live wanted={live['wanted']}, {int((time.time() - t0) * 1000)} ms", flush=True)
+            return self._reply(200, {"commands": cmds, "live": live})
+        if path == "/live":
+            return self._reply(200, store.live_hint())
+        if path == "/instructions":
+            return self._reply(200, {"instructions": store.instructions(
+                since=int(q.get("since", ["0"])[0]),
+                limit=int(q.get("limit", ["200"])[0]),
+                agent=q.get("agent", [None])[0])})
+        if path == "/agents":
+            from bridge import agents as ag
+            return self._reply(200, {"agents": ag.all_agents(), "chief": ag.CHIEF})
         if path == "/location":
             return self._reply(200, store.latest_location() or {"error": "never reported"})
+        if path.startswith("/photos/"):
+            # A contact photo as base64 JSON: a QML Image cannot send the bearer header,
+            # so the desktop fetches this and shows a data URL.
+            from bridge import contacts
+            f = contacts.photo_file(path.rsplit("/", 1)[-1])
+            if f is None:
+                return self._reply(404, {"error": "no such photo"})
+            data = f.read_bytes()
+            return self._reply(200, {"name": f.name, "type": "image/png" if f.suffix == ".png" else "image/jpeg",
+                                     "data": base64.b64encode(data).decode("ascii")})
         if path.startswith("/attachments/"):
             sha = path.rsplit("/", 1)[-1]
             try:
@@ -481,6 +561,11 @@ class H(http.server.BaseHTTPRequestHandler):
             if not p.exists():
                 return self._reply(404, {"error": "not held"})
             data = p.read_bytes()
+            if q.get("b64", ["0"])[0] == "1":
+                # For the desktop's thumbnails: a QML Image cannot send the bearer header,
+                # so it fetches JSON and shows a data URL, as with contact photos.
+                return self._reply(200, {"sha": sha, "size": len(data),
+                                         "data": base64.b64encode(data).decode("ascii")})
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))

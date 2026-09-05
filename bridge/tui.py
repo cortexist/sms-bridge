@@ -51,7 +51,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, OptionList, Static
+from textual.widgets import Button, Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from bridge import images, junk, store
@@ -65,6 +65,21 @@ try:
     from textual_image.widget import Image as ImageWidget
 except Exception:
     ImageWidget = None
+
+# KITTY_GRAPHICS: the terminal places images anchored to cells (Kitty/TGP, e.g.
+# ghostty) rather than sixel (foot). Only relevant to the CONTENT pane's message
+# images now: cell-anchored images scroll and clear natively, so the repaint hack
+# ChainPane uses is needed on sixel (foot) and skipped on Kitty (ghostty). The
+# conversation-list avatars are font GLYPHS, not images, so they need none of this.
+# Detected at import, before Textual starts (the terminal can't be queried after).
+KITTY_GRAPHICS = False
+if ImageWidget is not None:
+    try:
+        from textual_image.renderable import Image as _AutoRenderable
+        from textual_image.renderable.sixel import Image as _SixelRenderable
+        KITTY_GRAPHICS = _AutoRenderable is not _SixelRenderable
+    except Exception:
+        KITTY_GRAPHICS = False
 
 # Off-screen console purely for measuring how wide a bubble will actually render.
 # RichLog sizes a write to the renderable's OWN measured width, so Align.right never
@@ -94,7 +109,7 @@ PREVIEW_WIDTH = 36
 
 
 def pretty_addr(a: str) -> str:
-    """+18449963776 -> +1 (844) 996-3776. Long digit strings are unreadable."""
+    """+18005550199 -> +1 (800) 555-0199. Long digit strings are unreadable."""
     if not a:
         return "?"
     d = re.sub(r"\D", "", a)
@@ -150,34 +165,35 @@ ROW_SHADE = "on #2b3240"
 AVATAR_INDENT = 2        # columns before the avatar glyph
 OVERFILL = 12            # pad past the visible edge so the shade reaches it
 
-# Stable per-contact colour, so a conversation keeps the same badge between sessions
-# and you learn to recognise it by shape rather than by reading the number.
-AVATAR_COLOURS = ("cyan", "green", "magenta", "yellow", "blue", "red",
-                  "bright_cyan", "bright_green", "bright_magenta", "bright_blue")
+# Selection is shown as a left accent bar in column 0, not a background swap.
+ACCENT_GLYPH = "▌"  # ▌ full-height left half block
+ACCENT_STYLE = "bold cyan"
+
+# Nerd Font glyphs (the Font Awesome range, present in every Nerd Font build),
+# rendered as ORDINARY TEXT -- so they scroll cleanly and take the cell's colour in
+# any terminal, no sixel or Kitty graphics. The terminal's font fallback must supply
+# a Nerd Font (as configured for waybar); until then the codepoint shows as a box.
+# Single-cell on purpose; a larger icon would need a purpose-built multi-cell font.
+# Add per-kind codepoints here as the icon set grows (image/audio/video/pay/...).
+ICON_KEY = "\uf084"       # nf-fa-key: newest inbound message is a 2FA code
+ICON_MESSAGE = "\U000F0188"   # nf-fa-comment: everything else
+ICON_PIN = "\uf435"       # pinned-to-top marker on the name line
+ICON_STYLE = "#e2e2e2"    # normal text tone, matching the name text
 
 
 def avatar(thread: dict) -> Text:
-    """Exactly AVATAR_W cells on the left of every row.
+    """The single-cell icon glyph for a conversation.
 
-    A key when the NEWEST inbound message is a 2FA code. A code is a per-message
-    fact, not a property of the sender: a dedicated 2FA server sends nothing but
-    codes, so it keeps the key permanently; a person or a shop that once sent a
-    code shows the key only until their next ordinary text. Everything else gets a
-    coloured block for now; the space is reserved so a real avatar can go here
-    later without moving anything.
+    A key when the NEWEST inbound message is a 2FA code -- a per-message fact, not a
+    property of the sender: a dedicated 2FA server keeps the key permanently, while a
+    contact that once sent a code shows it only until their next ordinary text. A
+    message bubble otherwise.
 
-    Padded by CELL width, not character count: the key emoji occupies two columns
-    but is one character, so len() would size the column wrong.
+    Returns the BARE glyph; padding to the avatar column is the caller's job, sized
+    with cell width (a glyph may be one character but two columns wide).
     """
-    if thread.get("last_code"):
-        t = Text("\U0001f511", style="yellow")
-    else:
-        key = thread.get("norm") or thread["addr"]
-        colour = AVATAR_COLOURS[sum(map(ord, key)) % len(AVATAR_COLOURS)]
-        t = Text("\u2588\u2588", style=colour)
-    # Returns the BARE glyph, two cells wide. Padding is the caller's job: it sits at
-    # a different offset on the avatar row than the column width would imply.
-    return t
+    cp = ICON_KEY if thread.get("last_code") else ICON_MESSAGE
+    return Text(cp, style=ICON_STYLE)
 
 
 def date_rule(label: str, width: int) -> Text:
@@ -199,7 +215,20 @@ def date_rule(label: str, width: int) -> Text:
     return out
 
 
-def thread_row(t: dict, width: int, index: int = 0) -> Group:
+def _lead(n: int, accent: bool) -> Text:
+    """The n-column left margin of a row line, carrying the selection accent bar
+    in column 0 when this row is selected. Width is always exactly n, so the
+    accent never shifts the columns to its right."""
+    s = Text(no_wrap=True, overflow="crop")
+    if accent:
+        s.append(ACCENT_GLYPH, style=ACCENT_STYLE)
+        s.append(" " * (n - 1))
+    else:
+        s.append(" " * n)
+    return s
+
+
+def thread_row(t: dict, width: int, index: int = 0, accent: bool = False) -> Group:
     """One conversation: avatar column, then sender/time and preview.
 
     Plain Text lines rather than a Table. A Table.grid reflows its columns whenever
@@ -207,19 +236,22 @@ def thread_row(t: dict, width: int, index: int = 0) -> Group:
     width is smaller than the widget's content_size -- so the six-wide avatar column
     was being shrunk and ellipsised into "...". Text with overflow="crop" cannot
     reflow: it either fits or is cut, which is the behaviour wanted here.
+
+    The avatar glyph is a font ICON (see avatar()), rendered as ordinary text so it
+    scrolls and colours natively in any terminal -- no sixel, no Kitty graphics.
     """
     body_w = max(12, width - AVATAR_W)
 
     stamp = when(t["last"])
-    name = pretty_addr(t["addr"])
+    name = (t.get("name") or pretty_addr(t["addr"]))
     # Single-cell glyph on purpose: the padding below counts with len(), and a
     # double-width emoji would shift the timestamp column by one.
-    pin = "\u25c6 " if t.get("pinned") else ""
+    pin = ICON_PIN + " " if t.get("pinned") else ""
     name_max = max(4, body_w - len(stamp) - 1 - len(pin))
     if len(name) > name_max:
-        name = name[: name_max - 1] + "\u2026"
+        name = name[: name_max - 1] + "…"
 
-    head = Text(" " * AVATAR_W, no_wrap=True, overflow="crop")
+    head = _lead(AVATAR_W, accent)
     if pin:
         head.append(pin, style="bold yellow")
     head.append(name, style="bold")
@@ -231,14 +263,14 @@ def thread_row(t: dict, width: int, index: int = 0) -> Group:
 
     # The avatar sits on the SECOND row, indented two columns: against a three-row
     # entry that reads as vertically centred, where top-left read as a bullet.
-    av_row = Text(" " * AVATAR_INDENT, no_wrap=True, overflow="crop")
+    av_row = _lead(AVATAR_INDENT, accent)
     av_row.append_text(avatar(t))
     # cell_len already counts the indent and the glyph, so pad to AVATAR_W outright --
     # subtracting the indent a second time left this row one column left of the others.
     av_row.append(" " * max(1, AVATAR_W - cell_len(av_row.plain)))
     av_row.append(preview[0], style="dim")
 
-    tail = Text(" " * AVATAR_W, no_wrap=True, overflow="crop")
+    tail = _lead(AVATAR_W, accent)
     tail.append(preview[1], style="dim")
 
     lines = [head, av_row, tail]
@@ -272,19 +304,19 @@ class ThreadList(OptionList):
 
 
 class ChainPane(VerticalScroll):
-    """The message chain, with a full repaint on scroll.
+    """The message chain, with a full repaint on scroll -- on sixel terminals only.
 
-    Graphics protocols paint outside the widget tree: Textual repaints its own cells
-    when the pane scrolls, but the terminal's sixel data stays where it was until
-    something overwrites it, leaving residue -- most visibly on thin dim rules, which
-    nothing else repaints over. Forcing a repaint of the whole screen after a scroll
-    is the blunt fix available from this side; the protocol-level answer is Kitty's
-    placement/delete semantics, which foot does not implement.
+    Sixel data stays where the terminal painted it when Textual scrolls its cells,
+    leaving residue (most visibly on thin dim rules, which nothing else repaints
+    over). Forcing a whole-screen repaint after a scroll scrubs it. Kitty graphics
+    (ghostty) anchors images to cells and clears them on scroll natively, so the
+    repaint is not only unnecessary there, it adds flashing -- hence gated on
+    KITTY_GRAPHICS being false.
     """
 
     def watch_scroll_y(self, old: float, new: float) -> None:
         super().watch_scroll_y(old, new)
-        if int(old) != int(new):
+        if not KITTY_GRAPHICS and int(old) != int(new):
             self.screen.refresh(repaint=True)
 
 
@@ -333,10 +365,20 @@ class BridgeTUI(App):
     #body { height: 1fr; }
     #threads {
         width: 47;
+        border: none;
         border-right: solid $panel-darken-2;
         background: $surface;
     }
+    /* No focus box around the list: selection is the left accent bar instead. */
+    #threads:focus { border: none; border-right: solid $panel-darken-2; }
     #threads > .option-list--option { padding: 0; }
+    /* Suppress the native highlight background in both blurred and focused states,
+       so the only selection cue is the accent bar drawn into the row. */
+    #threads > .option-list--option-highlighted,
+    #threads:focus > .option-list--option-highlighted {
+        background: transparent;
+        text-style: none;
+    }
     #convo { width: 1fr; height: 1fr; padding: 0 1; }
     #convo > Static { height: auto; }
     /* height:auto lets the widget keep the image's aspect ratio; max-height stops a
@@ -366,9 +408,11 @@ class BridgeTUI(App):
         self.selected_thread: dict | None = None
         self.codes_only = False
         self.show_junk = False
+        self._accent_index: int | None = None   # row currently carrying the accent bar
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        # No Header: it only ever offered command search, which reads as message
+        # search and isn't. Conversation/message search will be its own feature.
         with Horizontal(id="body"):
             yield ThreadList(id="threads")
             yield ChainPane(id="convo")
@@ -387,6 +431,7 @@ class BridgeTUI(App):
     # ------------------------------------------------------------------ data
 
     def reload(self) -> None:
+        store.touch_presence()   # "a human is at the desk": the phone's live link keys on this
         rows = store.threads()
         # Quarantined conversations leave the main list and appear only under Q.
         # Hidden, never deleted -- the whole point of quarantine over blocking is
@@ -410,6 +455,7 @@ class BridgeTUI(App):
         lv = self.query_one("#threads", OptionList)
         keep = self.selected
         lv.clear_options()
+        self._accent_index = None   # options rebuilt; old index no longer valid
         width = self._list_width(lv)
         lv.add_options([Option(thread_row(t, width, i), id=self._key(t))
                         for i, t in enumerate(rows)])
@@ -418,6 +464,7 @@ class BridgeTUI(App):
             idx = next((i for i, t in enumerate(rows) if self._key(t) == keep), 0)
             lv.highlighted = idx
             self.show_thread(rows[idx])
+            self._set_accent(idx)
         else:
             self.query_one("#convo", ChainPane).remove_children()
             self.selected = None
@@ -428,17 +475,11 @@ class BridgeTUI(App):
         """Columns actually available to a row.
 
         content_size excludes padding and border but NOT the scrollbar, which is
-        always present here (301 conversations), so one more column comes off.
+        always present here, so one more column comes off. Six was measured, not
+        reasoned -- redo it with SMSTUI_SLACK if the chrome changes. Erring large is
+        safe (rows crop); erring small ate the avatars and the timestamps.
         """
         w = lv.content_size.width or lv.size.width or 44
-        # An option renders NARROWER than the list's content_size: the border, the
-        # scrollbar and OptionList's own per-option gutter all come off, and none of
-        # them are visible in any public measurement. Six was measured, not reasoned:
-        # render the app, look at whether a full timestamp survives, adjust. Redo it
-        # with SMSTUI_SLACK if the stylesheet or Textual's option chrome changes.
-        #
-        # Erring large is safe -- rows are cropped, so an underestimate leaves a small
-        # gap at the right. Erring small is what ate the avatars and the timestamps.
         return max(20, w - int(os.environ.get("SMSTUI_SLACK", "3")))
 
     def on_resize(self, event) -> None:
@@ -477,6 +518,12 @@ class BridgeTUI(App):
         self.selected_thread = t
         pane = self.query_one("#convo", ChainPane)
         pane.remove_children()
+        # Hide the pane until it has been scrolled to the newest message. Otherwise
+        # Textual paints from the TOP for a frame -- rendering (and, on the image
+        # widgets, encoding) the oldest messages, so years-old pictures flash by
+        # before scroll_end jumps to the bottom. visibility:hidden keeps the layout
+        # (so scroll_end can measure the height) but paints nothing.
+        pane.styles.visibility = "hidden"
 
         tid = t.get("thread")
         if tid is not None:
@@ -502,7 +549,7 @@ class BridgeTUI(App):
         pane_w = max(BUBBLE_MIN + 4, (pane.content_size.width or 60) - 1)
         bubble_w = max(BUBBLE_MIN, int(pane_w * BUBBLE_FRAC))
 
-        widgets.append(Static(Text(pretty_addr(t["addr"]), style="bold")))
+        widgets.append(Static(Text((t.get("name") or pretty_addr(t["addr"])), style="bold")))
 
         day = None
         for m in msgs:
@@ -571,7 +618,14 @@ class BridgeTUI(App):
                     widgets.append(Static(Text("  " + images.describe(part), style="dim")))
 
         pane.mount_all(widgets)
-        pane.scroll_end(animate=False)
+
+        # Reveal only after layout settles and we've jumped to the end, so the first
+        # visible frame is already at the newest message -- no top-of-thread flash.
+        def _reveal() -> None:
+            pane.scroll_end(animate=False)
+            pane.styles.visibility = "visible"
+
+        self.call_after_refresh(_reveal)
 
     # --------------------------------------------------------------- actions
 
@@ -579,6 +633,23 @@ class BridgeTUI(App):
             self, event: OptionList.OptionHighlighted) -> None:
         if 0 <= event.option_index < len(self.threads):
             self.show_thread(self.threads[event.option_index])
+            self._set_accent(event.option_index)
+
+    def _set_accent(self, new_index: int) -> None:
+        """Move the selection accent bar to `new_index`, re-rendering only the row
+        that loses it and the one that gains it. Cheap: two prompt replacements,
+        no full list rebuild, so cursor movement stays instant."""
+        if new_index == self._accent_index:
+            return
+        lv = self.query_one("#threads", OptionList)
+        width = self._list_width(lv)
+        prev = self._accent_index
+        self._accent_index = new_index
+        for i, accent in ((prev, False), (new_index, True)):
+            if i is None or not (0 <= i < len(self.threads)):
+                continue
+            lv.replace_option_prompt_at_index(
+                i, thread_row(self.threads[i], width, i, accent=accent))
 
     def action_reload(self) -> None:
         self.threads = []
@@ -646,7 +717,7 @@ class BridgeTUI(App):
         except Exception:
             pass
         self.notify(("Quarantined " if junk_flag else "Released ")
-                    + pretty_addr(t["addr"]), timeout=4)
+                    + (t.get("name") or pretty_addr(t["addr"])), timeout=4)
         self.threads = []
         self.reload()
 

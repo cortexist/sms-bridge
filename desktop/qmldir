@@ -1,0 +1,8 @@
+module SmsDesktop
+singleton Theme 1.0 Theme.qml
+singleton Bridge 1.0 Bridge.qml
+Mark 1.0 Mark.qml
+Avatar 1.0 Avatar.qml
+ThreadRow 1.0 ThreadRow.qml
+Bubble 1.0 Bubble.qml
+ControlShape 1.0 ControlShape.qml
