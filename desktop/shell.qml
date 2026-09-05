@@ -171,7 +171,7 @@ ShellRoot {
                     TextField {
                         id: input
                         anchors.fill: parent; anchors.margins: 2
-                        placeholderText: Bridge.selected && Bridge.selected.addr === "AGENTS" ? "tell the agents…" : "reply…"
+                        placeholderText: Bridge.isAgent(Bridge.selected) ? "tell " + Bridge.title(Bridge.selected) + "…" : "reply…"
                         placeholderTextColor: Theme.darkForeground
                         color: Theme.brightForeground; font.family: Theme.font; font.pixelSize: Theme.fontSize
                         background: null; leftPadding: 8
@@ -188,7 +188,10 @@ ShellRoot {
                     function fire() {
                         const body = input.text.trim(); if (!body || !Bridge.selected || busy) return
                         busy = true
-                        const addr = Bridge.selected.addr === "AGENTS" ? "AGENTS" : (Bridge.selected.in_addrs && Bridge.selected.in_addrs.length ? Bridge.selected.in_addrs[0] : Bridge.selected.addr)
+                        // An agent thread is addressed as its card says (chief@agents, ides@agents, or
+                        // the legacy AGENTS); a person by the address their last message came from.
+                        const addr = Bridge.isAgent(Bridge.selected) ? Bridge.selected.addr
+                            : (Bridge.selected.in_addrs && Bridge.selected.in_addrs.length ? Bridge.selected.in_addrs[0] : Bridge.selected.addr)
                         Bridge.send(addr, body, function() { busy = false; input.text = "" })
                     }
                     Text { anchors.centerIn: parent; text: sendButton.busy ? "…" : "send"; color: input.text.length ? Theme.onAccent() : Theme.darkForeground; font.family: Theme.font; font.pixelSize: Theme.fontSize }
