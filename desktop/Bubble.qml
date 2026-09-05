@@ -44,10 +44,15 @@ Item {
     readonly property color blockColor: failed ? Theme.red : !out ? Bridge.tint(thread) : Theme.outgoingAccent ? Theme.accent : Theme.lighterBackground
     readonly property real r: Theme.bubbleStyle === 1 ? 18 : 0
     readonly property real flat: Theme.bubbleStyle === 1 ? 4 : 0
-    // Corners of block i of this message: flattened toward a neighbour block, or toward a
-    // grouped neighbour message at the ends of the run.
+    // Corners of block i of this message: on the sender's side only (left for incoming,
+    // right for outgoing), flattened toward a neighbour block or a grouped neighbour
+    // message; the far side stays fully rounded, as the phone draws it.
     function topFlat(i) { return i > 0 || groupedWithPrevious }
     function bottomFlat(i) { return i < blocks - 1 || groupedWithNext }
+    function tl(i) { return !out && topFlat(i) ? flat : r }
+    function bl(i) { return !out && bottomFlat(i) ? flat : r }
+    function tr(i) { return out && topFlat(i) ? flat : r }
+    function br(i) { return out && bottomFlat(i) ? flat : r }
 
     // The phone's DateFormatter: time today, weekday and time inside a week, date beyond.
     function headerText(ts) {
@@ -105,10 +110,8 @@ Item {
                     Rectangle {   // placeholder while the thumbnail is on its way (or the phone is being asked)
                         anchors.fill: parent; visible: thumb.status !== Image.Ready
                         color: root.blockColor
-                        topLeftRadius: root.topFlat(mediaBlock.index) ? root.flat : root.r
-                        topRightRadius: root.topFlat(mediaBlock.index) ? root.flat : root.r
-                        bottomLeftRadius: root.bottomFlat(mediaBlock.index) ? root.flat : root.r
-                        bottomRightRadius: root.bottomFlat(mediaBlock.index) ? root.flat : root.r
+                        topLeftRadius: root.tl(mediaBlock.index); topRightRadius: root.tr(mediaBlock.index)
+                        bottomLeftRadius: root.bl(mediaBlock.index); bottomRightRadius: root.br(mediaBlock.index)
                         Text {
                             anchors.centerIn: parent
                             text: mediaBlock.src ? "…" : (mediaBlock.video ? "▶ video" : "▣ " + (mediaBlock.modelData.name || "image"))
@@ -128,10 +131,8 @@ Item {
                         anchors.fill: parent; visible: false; layer.enabled: thumb.status === Image.Ready
                         Rectangle {
                             anchors.fill: parent; color: "#000000"
-                            topLeftRadius: root.topFlat(mediaBlock.index) ? root.flat : root.r
-                            topRightRadius: root.topFlat(mediaBlock.index) ? root.flat : root.r
-                            bottomLeftRadius: root.bottomFlat(mediaBlock.index) ? root.flat : root.r
-                            bottomRightRadius: root.bottomFlat(mediaBlock.index) ? root.flat : root.r
+                            topLeftRadius: root.tl(mediaBlock.index); topRightRadius: root.tr(mediaBlock.index)
+                            bottomLeftRadius: root.bl(mediaBlock.index); bottomRightRadius: root.br(mediaBlock.index)
                         }
                     }
                     MultiEffect {
@@ -166,10 +167,8 @@ Item {
                 anchors.leftMargin: root.indent
                 width: Math.min(body.implicitWidth, root.inner) + 2 * Theme.pad
                 height: body.implicitHeight + 2 * Theme.pad
-                topLeftRadius: root.topFlat(i) ? root.flat : root.r
-                topRightRadius: root.topFlat(i) ? root.flat : root.r
-                bottomLeftRadius: root.bottomFlat(i) ? root.flat : root.r
-                bottomRightRadius: root.bottomFlat(i) ? root.flat : root.r
+                topLeftRadius: root.tl(i); topRightRadius: root.tr(i)
+                bottomLeftRadius: root.bl(i); bottomRightRadius: root.br(i)
                 color: root.blockColor
                 // Selected: an outline in the foreground colour, readable on any tint.
                 border.width: root.selectedMsg ? 2 : (Theme.bubbleStyle === 1 || root.tinted ? 0 : Theme.border)
