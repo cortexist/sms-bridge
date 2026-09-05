@@ -37,6 +37,13 @@ QtObject {
     // user's runtime directory (private, tmpfs, gone at logout); the file is removed when
     // the overlay closes so the token does not sit around as an image.
     readonly property string pairPayload: "smsforward://pair?endpoint=" + encodeURIComponent(base + "/sms") + "&token=" + encodeURIComponent(token)
+        + "&agents=" + encodeURIComponent(agentDomain)
+
+    // The domain of agent addresses, from the bridge (SMS_AGENTS_DOMAIN there), so every
+    // side agrees on what is an agent thread.
+    property string agentDomain: "agents"
+    function refreshAgents() { request("GET", "/agents", null, function(r) { if (r && r.domain) root.agentDomain = String(r.domain).toLowerCase() }) }
+    property Timer agentsTimer: Timer { interval: 300000; running: root.ready; repeat: true; triggeredOnStart: true; onTriggered: root.refreshAgents() }
     readonly property string qrPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/sms-desktop-pair.png"
     property int qrVersion: 0            // bumps so the Image reloads a regenerated file
     property bool qrReady: false
@@ -308,7 +315,7 @@ QtObject {
     // No contact names reach the bridge (the phone forwards messages, not contacts), so the
     // avatar carries the last two digits of the number, the part people actually remember,
     // and a colour hashed from the address -- the same "auto colour" idea as the phone.
-    function isAgent(t) { return !!t && (t.addr === "AGENTS" || /@agents$/i.test(t.addr || "")) }
+    function isAgent(t) { return !!t && (t.addr === "AGENTS" || (t.addr || "").toLowerCase().endsWith("@" + agentDomain)) }
     function title(t) {
         if (!t) return ""
         if (t.agent) return t.agent.name || t.name || t.addr

@@ -5,6 +5,7 @@ with a name, a virtual SMS address, an avatar expressed as two parameters, and o
 a mailbox -- because an agent cannot act for a real person without being one. Custom fields:
 
     X-SMS-ADDRESS   ides@agents      the thread the human talks to it in; never dialable
+                                     (the part after @ must be the configured DOMAIN)
     X-AGENT-COLOR   #9ece6a          avatar colour
     X-AGENT-SHAPE   0..3             avatar shape (square, rounded, round, squircle)
 
@@ -19,7 +20,11 @@ from pathlib import Path
 from bridge import contacts
 
 VDIR = Path(os.environ.get("SMS_AGENTS_DIR", contacts.VDIR / "agents"))
-CHIEF = "chief@agents"
+# The domain of every agent address (x@<domain>). "agents" by default; set
+# SMS_AGENTS_DOMAIN to one you own (agents.example.net) so no outside sender can
+# collide with it. The pairing code carries it to the phone, /agents to the desktop.
+DOMAIN = (os.environ.get("SMS_AGENTS_DOMAIN", "agents").strip().lstrip("@").lower()) or "agents"
+CHIEF = f"chief@{DOMAIN}"
 LEGACY = "AGENTS"
 
 _cache: dict = {"stamp": None, "agents": []}
@@ -27,7 +32,7 @@ _cache: dict = {"stamp": None, "agents": []}
 
 def is_agent(addr: str | None) -> bool:
     a = (addr or "").strip().lower()
-    return a == LEGACY.lower() or a.endswith("@agents")
+    return a == LEGACY.lower() or a.endswith("@" + DOMAIN)
 
 
 def _parse(text: str) -> dict | None:

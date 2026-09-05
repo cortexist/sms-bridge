@@ -698,7 +698,7 @@ def _record_notify(cmd: dict, result) -> None:
         return
     args = cmd.get("args") or {}
     add_message({"v": 1, "id": str(result["message"]), "dir": "in", "ts": int(time.time()),
-                 "rx": int(time.time()), "addr": result.get("addr") or args.get("addr") or "chief@agents",
+                 "rx": int(time.time()), "addr": result.get("addr") or args.get("addr") or __import__("bridge.agents", fromlist=["CHIEF"]).CHIEF,
                  "body": args.get("body", ""), "kind": "sms", "sub": -1, "code": None,
                  "agent": True})
 

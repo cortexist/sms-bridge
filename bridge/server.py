@@ -539,7 +539,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 agent=q.get("agent", [None])[0])})
         if path == "/agents":
             from bridge import agents as ag
-            return self._reply(200, {"agents": ag.all_agents(), "chief": ag.CHIEF})
+            return self._reply(200, {"agents": ag.all_agents(), "chief": ag.CHIEF, "domain": ag.DOMAIN})
         if path == "/location":
             return self._reply(200, store.latest_location() or {"error": "never reported"})
         if path.startswith("/photos/"):

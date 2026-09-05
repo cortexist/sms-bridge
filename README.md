@@ -53,6 +53,10 @@ RestartSec=5
 WantedBy=default.target
 ```
 
+Agent addresses are `<id>@agents` by default. Set `SMS_AGENTS_DOMAIN` (for example
+`agents.example.net`, a domain you own) so no outside sender can ever collide with them;
+the pairing code passes it to the phone and the desktop reads it from the bridge.
+
 Every request carries `Authorization: Bearer <token>`. The token is the only credential;
 the phone gets it from the pairing QR code, the desktop reads it from `~/.sms2fa/token`.
 
