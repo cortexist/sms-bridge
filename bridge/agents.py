@@ -11,8 +11,8 @@ a mailbox -- because an agent cannot act for a real person without being one. Cu
 
 Standard FN, EMAIL, PHOTO and NOTE are used as they are: with a PHOTO on the card the
 phone and the desktop show it instead of the drawn face (colour still tints the bubbles). The chief (chief@agents) is the
-front desk: any agent without a card speaks through it. "AGENTS" is the legacy channel
-the chief reads, not an alias for the chief.
+front desk: any agent without a card speaks through it. "AGENTS" is its old address, from
+before agents had names, and still resolves to it.
 """
 
 import os
@@ -99,14 +99,13 @@ def all_agents() -> list:
 
 
 def lookup(key: str | None) -> dict | None:
-    """By short id ("ides") or address ("ides@agents"). The legacy AGENTS address is a
-    channel, not an agent: it names the function (everyone's front desk), while Chief
-    is the entity that reads it, at chief@agents. So it resolves to no identity."""
+    """By short id ("ides"), address ("ides@agents") or the legacy AGENTS address, which
+    is Chief's old address: that thread is Chief's history and shows as Chief."""
     if not key:
         return None
     k = key.strip().lower()
     if k == LEGACY.lower():
-        return None
+        k = CHIEF
     _load()
     for a in _cache["agents"]:
         if k in (a["id"], a["addr"]):

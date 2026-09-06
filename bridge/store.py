@@ -416,8 +416,6 @@ def threads() -> list:
             t["agent"] = {k: agent[k] for k in ("id", "addr", "color", "shape")}
             if agent.get("photo"):
                 t["photo"] = agent["photo"]     # the card's photo, shown instead of the face
-        elif t["addr"] == AGENT_ADDR:
-            t["name"] = "Agents"          # the channel itself, from before agents had names
         out.append(t)
     cur_pins = pins()
     for t in out:
