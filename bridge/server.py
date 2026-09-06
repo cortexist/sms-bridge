@@ -167,11 +167,24 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._quarantine()
         if path == "/blocked":
             return self._blocked()
+        if path == "/unread":
+            obj, err = self._json_body()
+            if obj is None:
+                return err
+            ids = obj.get("unread")
+            if not isinstance(ids, list):
+                return self._reply(400, {"error": "unread must be a list of thread ids"})
+            store.set_unread(ids)
+            return self._reply(200, {"ok": True, "unread": len(ids)})
         if path == "/commands":
             # The desktop app queues a command for the phone: {"op": ..., "args": {...}}.
             body, err = self._json_body()
             if body is None:
                 return err
+            # Opening a thread on the desktop reads it: cleared here at once, so the list
+            # does not stay bold until the phone's push comes back.
+            if str(body.get("op", "")) == "mark_read":
+                store.mark_read((body.get("args") or {}).get("threads") or [])
             try:
                 cmd = store.enqueue(str(body.get("op", "")), **(body.get("args") or {}))
             except (ValueError, TypeError) as e:
@@ -236,6 +249,8 @@ class H(http.server.BaseHTTPRequestHandler):
 
         if fresh:
             self._auto_classify(rec)
+            if rec.get("dir") == "in" and rec.get("thread") is not None:
+                store.mark_unread(rec["thread"])
 
         # Piggyback: the response carries whatever the desktop queued, and the live hint.
         return self._reply(200, {"ok": True, "commands": store.pending(), "live": store.live_hint()})
@@ -506,11 +521,13 @@ class H(http.server.BaseHTTPRequestHandler):
             # its verdict (`junk`, with `junk_source`) so the desktop can quarantine the
             # way the TUI does; a phone-side block arrives here as a phone verdict.
             verdicts = store.verdicts()
+            unread = store.unread_threads()
             out = []
             for t in store.threads():
                 v = verdicts.get(store.verdict_key(t))
                 t["junk"] = bool(v and v.get("junk"))
                 t["junk_source"] = v.get("source") if v and v.get("junk") else None
+                t["unread"] = t.get("thread") in unread
                 out.append(t)
             return self._reply(200, {"threads": out})
         if path == "/commands":

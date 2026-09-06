@@ -51,6 +51,7 @@ ATTACH = DIR / "attachments"
 # Touched by a desktop app while it is open (the TUI does it on every refresh). Its
 # mtime is the "a human is at the desk" signal behind the phone's live link.
 PRESENCE = DIR / "presence"
+UNREAD = DIR / "unread.json"      # thread ids the phone says are unread; see set_unread()
 PRESENCE_TTL = 60
 
 # The command vocabulary is QUIK's interactor set, deliberately. The rule is that a
@@ -535,6 +536,39 @@ def latest_location() -> dict | None:
 
 
 # -------------------------------------------------------------------- presence / live link
+
+# ------------------------------------------------------------------- unread state
+
+def unread_threads() -> set:
+    try:
+        return {int(x) for x in json.loads(UNREAD.read_text() or "[]")}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def _write_unread(ids: set) -> None:
+    _ensure_dir()
+    tmp = UNREAD.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(ids)))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, UNREAD)
+
+
+def set_unread(ids) -> None:
+    """The phone's complete unread state: every thread whose last message is unread."""
+    _write_unread({int(x) for x in ids if str(x).lstrip("-").isdigit()})
+
+
+def mark_unread(thread) -> None:
+    """A new inbound message: unread until the phone reports otherwise."""
+    if thread is not None:
+        _write_unread(unread_threads() | {int(thread)})
+
+
+def mark_read(threads) -> None:
+    """The desktop opened it: cleared here at once, the phone confirms on its next push."""
+    _write_unread(unread_threads() - {int(t) for t in threads if str(t).lstrip("-").isdigit()})
+
 
 def touch_presence(lan: list | None = None) -> None:
     """A desktop app is open. Call every few seconds while it is; stop when it closes.

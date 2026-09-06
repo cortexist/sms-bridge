@@ -264,7 +264,16 @@ QtObject {
         request("POST", "/commands", { op: "send", args: { addr: addr, body: body } }, function(r) { if (cb) cb(r) })
     }
 
-    function select(t) { selected = t; messages = []; selectedMessage = null; refreshMessages() }
+    function select(t) {
+        selected = t; messages = []; selectedMessage = null; refreshMessages()
+        // Opening a thread reads it, on the phone too: the bridge clears its mark at once
+        // and the phone marks the conversation read when it applies the command.
+        if (t && t.unread && t.thread !== null && t.thread !== undefined) {
+            request("POST", "/commands", { op: "mark_read", args: { threads: [t.thread] } }, function() {})
+            const patch = x => (sameThread(x, t) ? Object.assign({}, x, { unread: false }) : x)
+            allThreads = allThreads.map(patch); threads = threads.map(patch); selected = patch(t)
+        }
+    }
 
     // A selected message: click a bubble, ctrl+c copies its text to the system clipboard.
     // Message-level text is the unit; the phone has no equivalent, the desktop should.

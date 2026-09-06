@@ -54,10 +54,14 @@ Rectangle {
         Text {
             width: parent.width
             text: root.thread ? ((root.thread.last_out ? "you: " : "") + (root.thread.preview || "").replace(/\s+/g, " ")) : ""
-            color: root.thread && root.thread.last_failed ? Theme.red : Theme.foreground
-            font.family: Theme.font; font.pixelSize: Theme.fontSmall
+            // Unread, as on the phone: the preview in bold and the bright text colour, with a
+            // small oval in the conversation's colour at the end of the line.
+            readonly property bool unread: !!(root.thread && root.thread.unread)
+            color: root.thread && root.thread.last_failed ? Theme.red : (unread ? Theme.brightForeground : Theme.foreground)
+            font.family: Theme.font; font.pixelSize: Theme.fontSmall; font.bold: unread
             elide: Text.ElideRight; maximumLineCount: 1
             height: root.line; verticalAlignment: Text.AlignVCenter
+            rightPadding: unread ? 26 : 0
         }
     }
     Text {
@@ -67,6 +71,14 @@ Rectangle {
         height: root.line; verticalAlignment: Text.AlignVCenter   // on the first line, with the name
         text: root.thread ? Bridge.when(root.thread.last) : ""
         color: Theme.darkForeground; font.family: Theme.font; font.pixelSize: Theme.fontSmall
+        font.bold: !!(root.thread && root.thread.unread)
+    }
+    Rectangle {   // the unread oval, on the second line, in the conversation's colour
+        visible: !!(root.thread && root.thread.unread)
+        width: 20; height: 14; radius: 7
+        color: Bridge.tint(root.thread)
+        anchors.right: parent.right; anchors.rightMargin: Theme.pad
+        y: Math.round(1.5 * root.line + (root.line - height) / 2)
     }
     MouseArea { anchors.fill: parent; onClicked: root.clicked() }
 }
