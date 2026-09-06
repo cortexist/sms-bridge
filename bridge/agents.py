@@ -9,7 +9,8 @@ a mailbox -- because an agent cannot act for a real person without being one. Cu
     X-AGENT-COLOR   #9ece6a          avatar colour
     X-AGENT-SHAPE   0..3             avatar shape (square, rounded, round, squircle)
 
-Standard FN, EMAIL, PHOTO and NOTE are used as they are. The chief (chief@agents) is the
+Standard FN, EMAIL, PHOTO and NOTE are used as they are: with a PHOTO on the card the
+phone and the desktop show it instead of the drawn face (colour still tints the bubbles). The chief (chief@agents) is the
 front desk: any agent without a card speaks through it. "AGENTS" is the legacy channel
 the chief reads, not an alias for the chief.
 """
@@ -36,12 +37,13 @@ def is_agent(addr: str | None) -> bool:
 
 
 def _parse(text: str) -> dict | None:
-    fn, addr, color, shape, email, note = "", "", "", None, "", ""
+    fn, addr, color, shape, email, note, photo = "", "", "", None, "", "", None
     for line in contacts._unfold(text):
         key, _, value = line.partition(":")
         name = key.split(";")[0].upper()
         v = value.strip()
         if name == "FN": fn = v
+        elif name == "PHOTO": photo = contacts._photo_bytes(key, value)
         elif name == "X-SMS-ADDRESS": addr = v.lower()
         elif name == "X-AGENT-COLOR": color = v
         elif name == "X-AGENT-SHAPE": shape = int(v) if v.isdigit() else None
@@ -49,8 +51,27 @@ def _parse(text: str) -> dict | None:
         elif name == "NOTE": note = v.replace("\\n", "\n").replace("\\,", ",")
     if not fn or not addr:
         return None
+    path = contacts._store_photo(photo) if photo else None
     return {"id": addr.split("@")[0], "addr": addr, "name": fn, "color": color or "#7aa2f7",
-            "shape": shape if shape is not None else 0, "email": email, "note": note}
+            "shape": shape if shape is not None else 0, "email": email, "note": note,
+            "photo": ("/photos/" + Path(path).name) if path else None}
+
+
+def photo_data_uri(agent: dict | None) -> str | None:
+    """The agent's card photo as a data URI, for the notify command: the phone keeps it
+    beside the name and colour and shows it as the avatar. Card photos are small (a few
+    kilobytes); anything over 64 KB is left out rather than bloating every notify."""
+    if not agent or not agent.get("photo"):
+        return None
+    f = contacts.photo_file(agent["photo"].rsplit("/", 1)[-1])
+    if f is None:
+        return None
+    data = f.read_bytes()
+    if len(data) > 65536:
+        return None
+    import base64
+    mime = "image/png" if f.suffix == ".png" else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _load() -> None:
