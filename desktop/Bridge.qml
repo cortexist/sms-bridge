@@ -319,7 +319,6 @@ QtObject {
     function title(t) {
         if (!t) return ""
         if (t.agent) return t.agent.name || t.name || t.addr
-        if (t.addr === "AGENTS") return t.name || "Chief"     // Chief's old address
         return t.name || pretty(t.addr)
     }
     function initials(t) {
