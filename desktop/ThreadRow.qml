@@ -61,7 +61,7 @@ Rectangle {
             font.family: Theme.font; font.pixelSize: Theme.fontSmall; font.bold: unread
             elide: Text.ElideRight; maximumLineCount: 1
             height: root.line; verticalAlignment: Text.AlignVCenter
-            rightPadding: unread ? 26 : 0
+            rightPadding: unread ? 24 : 0
         }
     }
     Text {
@@ -73,11 +73,11 @@ Rectangle {
         color: Theme.darkForeground; font.family: Theme.font; font.pixelSize: Theme.fontSmall
         font.bold: !!(root.thread && root.thread.unread)
     }
-    Rectangle {   // the unread oval, on the second line, in the conversation's colour
+    Rectangle {   // unread: a filled dot on the second line, in the conversation's colour
         visible: !!(root.thread && root.thread.unread)
-        width: 20; height: 14; radius: 7
+        width: 10; height: width; radius: width / 2
         color: Bridge.tint(root.thread)
-        anchors.right: parent.right; anchors.rightMargin: Theme.pad
+        anchors.right: parent.right; anchors.rightMargin: Theme.pad + 5
         y: Math.round(1.5 * root.line + (root.line - height) / 2)
     }
     MouseArea { anchors.fill: parent; onClicked: root.clicked() }

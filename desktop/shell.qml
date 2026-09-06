@@ -11,6 +11,10 @@ ShellRoot {
         implicitWidth: 1040; implicitHeight: 680
         minimumSize: Qt.size(720, 420)
         color: Theme.background
+        // Quickshell is a shell: closing its window (sway's kill, the close button) only
+        // hides it and the process stays. This is an app with one window, so closing it
+        // ends the process.
+        onVisibleChanged: if (!visible) Qt.quit()
 
         // ctrl+c: the reply field's own selection when it has one, else the selected message.
         Shortcut {
