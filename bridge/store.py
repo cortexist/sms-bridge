@@ -547,8 +547,11 @@ def unread_threads() -> set:
 
 
 def _write_unread(ids: set) -> None:
+    """Atomic replace through a per-call temp name: the phone pushes from a kick and
+    from a drain at the same moment, and two writers sharing one temp file made the
+    second replace fail (observed 2026-09-05)."""
     _ensure_dir()
-    tmp = UNREAD.with_suffix(".tmp")
+    tmp = UNREAD.with_name(f".unread.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(sorted(ids)))
     os.chmod(tmp, 0o600)
     os.replace(tmp, UNREAD)
@@ -731,7 +734,9 @@ def _record_notify(cmd: dict, result) -> None:
     if not isinstance(result, dict) or not result.get("message"):
         return
     args = cmd.get("args") or {}
+    thread = result.get("thread")
     add_message({"v": 1, "id": str(result["message"]), "dir": "in", "ts": int(time.time()),
+                 "thread": int(thread) if isinstance(thread, (int, float)) or str(thread).isdigit() else None,
                  "rx": int(time.time()), "addr": result.get("addr") or args.get("addr") or __import__("bridge.agents", fromlist=["CHIEF"]).CHIEF,
                  "body": args.get("body", ""), "kind": "sms", "sub": -1, "code": None,
                  "agent": True})
